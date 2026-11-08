@@ -310,38 +310,62 @@ def find_matching_train_button(
     return found_result
 
 
-def handle_recaptcha_if_prompted(page: Page):
-    """
-    Handle KTMB's `#recaptcha-modal` on `/ShuttleTrip/Reserve`.
-    """
-    page.wait_for_timeout(800)
-    modal = page.locator("#recaptcha-modal")
-    if modal.count() > 0 and modal.is_visible():
-        print("[*] reCAPTCHA modal detected. Attempting checkbox click...")
-        try:
-            frame = page.frame_locator("iframe[title='reCAPTCHA']").first
-            checkbox = frame.locator("#recaptcha-anchor")
-            if checkbox.count() > 0:
-                checkbox.click()
-                page.wait_for_timeout(1500)
-        except Exception:
-            pass
+def get_vnc_url() -> str:
+    vnc_url = os.getenv("VNC_PUBLIC_URL", "").strip()
+    if not vnc_url or "your-lxc-ip" in vnc_url:
+        return "http://100.108.209.57:6080/vnc.html"
+    return vnc_url
 
-        if modal.is_visible() and "/BookShuttle" not in page.url:
-            vnc_url = os.getenv("VNC_PUBLIC_URL", "")
-            notify(
-                "reCAPTCHA Challenge",
-                f"Train found! Please solve the reCAPTCHA in NoVNC to lock the seat: {vnc_url}",
-                page=page,
-            )
-            page.wait_for_function(
-                """() => {
-                    const m = document.querySelector('#recaptcha-modal');
-                    return (!m || (!m.classList.contains('show') && m.style.display === 'none')) || window.location.pathname.includes('BookShuttle');
-                }""",
-                timeout=180_000,
-            )
-            print("[+] reCAPTCHA solved!")
+
+def reserve_and_wait_passenger_page(page: Page, timeout_sec: int = 180) -> bool:
+    """
+    After clicking Select on a train, handles waiting for reCAPTCHA (and sending Telegram alert
+    with NoVNC link if visual challenge appears), clicking .btn-passenger, and waiting for
+    the page to navigate to /BookShuttle.
+    """
+    start_time = time.time()
+    vnc_alert_sent = False
+    print("[*] Waiting for seat reservation / reCAPTCHA / navigation to /BookShuttle...")
+
+    while time.time() - start_time < timeout_sec:
+        if "/BookShuttle" in page.url:
+            print("[+] Successfully navigated to /BookShuttle!")
+            return True
+
+        # Check for reCAPTCHA modal
+        modal = page.locator("#recaptcha-modal")
+        if modal.count() > 0 and modal.is_visible():
+            # Try clicking the reCAPTCHA checkbox automatically if not already clicked
+            try:
+                frame = page.frame_locator("iframe[title='reCAPTCHA']").first
+                checkbox = frame.locator("#recaptcha-anchor")
+                if checkbox.count() > 0 and checkbox.is_visible():
+                    checkbox.click()
+                    page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            if not vnc_alert_sent:
+                vnc_url = get_vnc_url()
+                notify(
+                    "reCAPTCHA Challenge",
+                    f"Train found! Please solve the reCAPTCHA in NoVNC to lock the seat: {vnc_url}",
+                    page=page,
+                )
+                vnc_alert_sent = True
+
+        # Check for .btn-passenger (in case manual confirmation is needed)
+        proceed_btn = page.locator(".btn-passenger")
+        if proceed_btn.count() > 0 and proceed_btn.is_visible():
+            try:
+                proceed_btn.click()
+            except Exception:
+                pass
+
+        page.wait_for_timeout(1000)
+
+    notify("Reservation Timeout", "Timed out waiting for reCAPTCHA to be solved or /BookShuttle to load.", page=page)
+    return False
 
 
 def automate_passenger_and_checkout(
@@ -355,8 +379,12 @@ def automate_passenger_and_checkout(
     """
     Complete `/BookShuttle` passenger selection and KTM Wallet payment.
     """
-    print("[*] Waiting for Passenger Details page (/BookShuttle)...")
-    page.wait_for_url("**/BookShuttle**", timeout=30_000)
+    if "/BookShuttle" not in page.url:
+        try:
+            page.wait_for_url("**/BookShuttle**", timeout=15_000)
+        except PlaywrightTimeoutError:
+            return False
+
     page.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(1000)
 
@@ -536,11 +564,10 @@ def scan_and_snipe_all_dates(
                 if btn:
                     print(f"[!] Clicking Select on {target_date} {chosen_time} ({seats_avail} available)...")
                     btn.click()
-                    handle_recaptcha_if_prompted(page)
-
-                    proceed_btn = page.locator(".btn-passenger")
-                    if proceed_btn.count() > 0 and proceed_btn.is_visible():
-                        proceed_btn.click()
+                    nav_ok = reserve_and_wait_passenger_page(page, timeout_sec=180)
+                    if not nav_ok:
+                        print("[!] Did not reach /BookShuttle in time. Continuing scan...")
+                        break
 
                     if search_pax >= 2:
                         current_pax_match = [p for p in pax_names if p]
