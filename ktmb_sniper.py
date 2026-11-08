@@ -517,33 +517,52 @@ def automate_passenger_and_checkout(
     except Exception as e:
         print(f"[*] 'I am travelling' checkbox note: {e}")
 
-    # 2. Fill Passenger 2 (and other passengers) via "Select Friends and Family" dropdown
+    # 2. Fill each passenger's "Select Friends and Family" dropdown.
+    #    Dropdown N gets passenger_matches[N]; a person already picked in an earlier
+    #    dropdown is never reused (KTMB rejects "Duplicated passport number").
     try:
+        names = [n for n in (passenger_matches or []) if n]
+        used_labels: set[str] = set()
+        dropdown_no = 0
         all_selects = page.locator("select").all()
         for sel in all_selects:
             try:
                 opts_text = [t.strip() for t in sel.locator("option").all_inner_texts()]
-                if any("friends" in o.lower() or "family" in o.lower() for o in opts_text):
-                    print(f"[*] Found Friends & Family dropdown with options: {opts_text}")
-                    selected = False
-                    for target_name in (passenger_matches or []):
-                        if not target_name:
-                            continue
-                        for idx, opt_label in enumerate(opts_text):
-                            if target_name.lower() in opt_label.lower():
-                                sel.select_option(index=idx)
-                                sel.dispatch_event("change")
-                                print(f"[+] Selected '{opt_label}' for passenger {target_name}")
-                                selected = True
-                                break
-                        if selected:
-                            break
+                if not any("friends" in o.lower() or "family" in o.lower() for o in opts_text):
+                    continue
+                print(f"[*] Found passenger dropdown #{dropdown_no + 1} with options: {opts_text}")
 
-                    if not selected and len(opts_text) > 1:
-                        sel.select_option(index=1)
-                        sel.dispatch_event("change")
-                        print(f"[+] Selected default option #1 ('{opts_text[1]}') from dropdown")
-                    page.wait_for_timeout(400)
+                def _pick(label_filter) -> int | None:
+                    for idx, opt_label in enumerate(opts_text):
+                        if idx == 0 or not opt_label or opt_label in used_labels:
+                            continue
+                        if label_filter(opt_label):
+                            return idx
+                    return None
+
+                # Preferred: the name configured for this passenger slot.
+                chosen = None
+                if dropdown_no < len(names):
+                    target = names[dropdown_no].lower()
+                    chosen = _pick(lambda o: target in o.lower())
+                # Fallback: any remaining name from the configured list, then any unused option.
+                if chosen is None:
+                    for target_name in names:
+                        chosen = _pick(lambda o, t=target_name.lower(): t in o.lower())
+                        if chosen is not None:
+                            break
+                if chosen is None:
+                    chosen = _pick(lambda o: True)
+
+                if chosen is not None:
+                    sel.select_option(index=chosen)
+                    sel.dispatch_event("change")
+                    used_labels.add(opts_text[chosen])
+                    print(f"[+] Passenger {dropdown_no + 1}: selected '{opts_text[chosen]}'")
+                else:
+                    print(f"[!] Passenger {dropdown_no + 1}: no unused saved passenger available")
+                dropdown_no += 1
+                page.wait_for_timeout(400)
             except Exception as ex:
                 print(f"[*] Friends & Family dropdown item error: {ex}")
     except Exception as e:
