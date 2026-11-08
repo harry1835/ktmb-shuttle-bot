@@ -317,14 +317,100 @@ def get_vnc_url() -> str:
     return vnc_url
 
 
+def transcribe_audio_groq(audio_url: str, groq_api_key: str) -> str:
+    """Download reCAPTCHA audio challenge MP3 and transcribe digits using Groq Whisper."""
+    print(f"[*] Downloading reCAPTCHA audio challenge from Google...")
+    req = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    audio_data = urllib.request.urlopen(req, timeout=15).read()
+
+    boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+    body = []
+    body.append(f"--{boundary}\r\n".encode())
+    body.append(b'Content-Disposition: form-data; name="file"; filename="audio.mp3"\r\n')
+    body.append(b"Content-Type: audio/mp3\r\n\r\n")
+    body.append(audio_data)
+    body.append(b"\r\n")
+    body.append(f"--{boundary}\r\n".encode())
+    body.append(b'Content-Disposition: form-data; name="model"\r\n\r\n')
+    body.append(b"whisper-large-v3-turbo\r\n")
+    body.append(f"--{boundary}\r\n".encode())
+    body.append(b'Content-Disposition: form-data; name="response_format"\r\n\r\n')
+    body.append(b"json\r\n")
+    body.append(f"--{boundary}--\r\n".encode())
+
+    payload = b"".join(body)
+    groq_req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/audio/transcriptions",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {groq_api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+    )
+    resp = urllib.request.urlopen(groq_req, timeout=20)
+    res_json = json.loads(resp.read().decode("utf-8"))
+    transcribed_text = res_json.get("text", "").strip()
+    print(f"[+] Groq Whisper transcribed audio: '{transcribed_text}'")
+    return transcribed_text
+
+
+def try_solve_audio_recaptcha(page: Page, groq_api_key: str) -> bool:
+    """Attempts to auto-solve reCAPTCHA v2 using audio challenge + Groq Whisper."""
+    if not groq_api_key:
+        return False
+
+    try:
+        bframe = page.frame_locator("iframe[title*='recaptcha challenge']").first
+        audio_btn = bframe.locator("#recaptcha-audio-button")
+        if audio_btn.count() == 0 or not audio_btn.is_visible():
+            return False
+
+        print("[*] reCAPTCHA challenge detected! Switching to Audio challenge for Groq Whisper...")
+        audio_btn.click()
+        page.wait_for_timeout(1500)
+
+        # Check if Google blocked audio ("Your computer or network may be sending automated queries")
+        doscaptcha = bframe.locator(".rc-doscaptcha-header")
+        if doscaptcha.count() > 0 and doscaptcha.is_visible():
+            print("[!] Google blocked audio challenge on this IP (doscaptcha). Falling back to NoVNC.")
+            return False
+
+        # Find audio download link or source
+        audio_source = bframe.locator("#audio-source, a.rc-audiochallenge-tdownload-link")
+        if audio_source.count() == 0:
+            return False
+
+        audio_url = audio_source.first.get_attribute("src") or audio_source.first.get_attribute("href")
+        if not audio_url:
+            return False
+
+        text = transcribe_audio_groq(audio_url, groq_api_key)
+        if not text:
+            return False
+
+        input_box = bframe.locator("#audio-response")
+        input_box.fill(text)
+        page.wait_for_timeout(300)
+
+        verify_btn = bframe.locator("#recaptcha-verify-button")
+        verify_btn.click()
+        print("[+] Clicked verify on audio challenge! Waiting for KTMB reservation...")
+        page.wait_for_timeout(2000)
+        return True
+    except Exception as e:
+        print(f"[!] Audio solver note: {e}")
+        return False
+
+
 def reserve_and_wait_passenger_page(page: Page, timeout_sec: int = 180) -> bool:
     """
-    After clicking Select on a train, handles waiting for reCAPTCHA (and sending Telegram alert
-    with NoVNC link if visual challenge appears), clicking .btn-passenger, and waiting for
-    the page to navigate to /BookShuttle.
+    After clicking Select on a train, handles waiting for reCAPTCHA (auto-solving via Groq Whisper
+    if GROQ_API_KEY is configured, or sending Telegram alert with NoVNC link if visual challenge appears),
+    clicking .btn-passenger, and waiting for the page to navigate to /BookShuttle.
     """
     start_time = time.time()
     vnc_alert_sent = False
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
     print("[*] Waiting for seat reservation / reCAPTCHA / navigation to /BookShuttle...")
 
     while time.time() - start_time < timeout_sec:
@@ -335,16 +421,25 @@ def reserve_and_wait_passenger_page(page: Page, timeout_sec: int = 180) -> bool:
         # Check for reCAPTCHA modal
         modal = page.locator("#recaptcha-modal")
         if modal.count() > 0 and modal.is_visible():
-            # Try clicking the reCAPTCHA checkbox automatically if not already clicked
+            # 1. Try clicking the reCAPTCHA checkbox automatically
             try:
                 frame = page.frame_locator("iframe[title='reCAPTCHA']").first
                 checkbox = frame.locator("#recaptcha-anchor")
                 if checkbox.count() > 0 and checkbox.is_visible():
                     checkbox.click()
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(1200)
             except Exception:
                 pass
 
+            # 2. If challenge appears and Groq API key is set, try audio auto-solve!
+            if groq_api_key:
+                solved = try_solve_audio_recaptcha(page, groq_api_key)
+                if solved:
+                    page.wait_for_timeout(1500)
+                    if "/BookShuttle" in page.url:
+                        return True
+
+            # 3. Fallback alert to Telegram with NoVNC link
             if not vnc_alert_sent:
                 vnc_url = get_vnc_url()
                 notify(
@@ -354,7 +449,7 @@ def reserve_and_wait_passenger_page(page: Page, timeout_sec: int = 180) -> bool:
                 )
                 vnc_alert_sent = True
 
-        # Check for .btn-passenger (in case manual confirmation is needed)
+        # Check for .btn-passenger
         proceed_btn = page.locator(".btn-passenger")
         if proceed_btn.count() > 0 and proceed_btn.is_visible():
             try:
