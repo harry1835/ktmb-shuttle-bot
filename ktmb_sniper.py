@@ -699,13 +699,30 @@ def scan_and_snipe_all_dates(
         time.sleep(poll_interval)
 
 
+def register_telegram_bot_commands(token: str):
+    """Registers slash commands with Telegram so they appear in the autocomplete popup."""
+    try:
+        commands = [
+            {"command": "help", "description": "Show available commands & examples"},
+            {"command": "scrap_saturday_woodlands_tebrau", "description": "PDF report for all Saturdays (Woodlands -> JB)"},
+            {"command": "scrap_sunday_tebrau_woodlands", "description": "PDF report for all Sundays (JB -> Woodlands)"},
+            {"command": "status", "description": "Show current bot booking state"},
+        ]
+        data = urllib.parse.urlencode({"commands": json.dumps(commands)}).encode("utf-8")
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/setMyCommands", data=data)
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"[*] Note registering bot commands: {e}")
+
+
 def start_telegram_command_listener():
-    """Background listener for Telegram commands (/scrap-saturday-woodlands-tebrau, etc.)."""
+    """Background listener for Telegram commands (/scrap-saturday-woodlands-tebrau, /help, etc.)."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         return
 
-    print("[*] Telegram command listener started (listening for /scrap-saturday..., /scrap-day/...)")
+    register_telegram_bot_commands(token)
+    print("[*] Telegram command listener started (listening for /scrap, /help, /status)")
     last_update_id = 0
 
     while True:
@@ -725,7 +742,10 @@ def start_telegram_command_listener():
                 text = msg.get("text", "").strip()
                 chat_id = str(msg["chat"]["id"])
 
-                if text.startswith("/scrap"):
+                # Normalize command if bot username is appended (e.g. /help@MyBot)
+                cmd_clean = text.split("@")[0].lower()
+
+                if cmd_clean.startswith("/scrap"):
                     print(f"[*] Received Telegram command: '{text}' from chat {chat_id}")
                     send_telegram(f"⏳ Generating available seats PDF report for `{text}`... Please wait ~10-15s.")
                     threading.Thread(
@@ -733,18 +753,28 @@ def start_telegram_command_listener():
                         args=(text, chat_id),
                         daemon=True,
                     ).start()
-                elif text in ("/help", "/start"):
+                elif cmd_clean == "/status":
+                    state = load_state()
+                    summary_lines = []
+                    for k, v in state.items():
+                        summary_lines.append(f"• *{k}*: {v.get('booked_pax', 0)} pax booked at {v.get('locked_train_time')}")
+                    state_msg = "\n".join(summary_lines) if summary_lines else "No bookings recorded yet."
+                    send_telegram(f"📋 *Current Bot Booking State:*\n\n{state_msg}")
+                elif cmd_clean in ("/help", "/start"):
                     help_msg = (
-                        "🤖 *KTMB Shuttle Tebrau PDF Reports Bot*\n\n"
-                        "Send me any of these commands to get a live PDF of available seats:\n\n"
-                        "1️⃣ `/scrap-saturday-woodlands-tebrau`\n"
-                        "   Scrapes all released Saturdays (Woodlands ➔ JB Sentral)\n\n"
-                        "2️⃣ `/scrap-sunday-tebrau-woodlands`\n"
-                        "   Scrapes all released Sundays (JB Sentral ➔ Woodlands)\n\n"
-                        "3️⃣ `/scrap-day/YYYYMMDD-departure-arrival`\n"
-                        "   Scrapes a single date, e.g.:\n"
-                        "   `/scrap-day/20261115-woodlands-tebrau`\n"
-                        "   `/scrap-day/20261115-tebrau-woodlands`"
+                        "🤖 *KTMB Shuttle Tebrau Bot Commands*\n\n"
+                        "📌 *On-Demand PDF Reports:*\n"
+                        "• `/scrap-saturday-woodlands-tebrau`\n"
+                        "  _Generates a PDF of all released Saturdays (Woodlands CIQ ➔ JB Sentral) showing only available seats._\n\n"
+                        "• `/scrap-sunday-tebrau-woodlands`\n"
+                        "  _Generates a PDF of all released Sundays (JB Sentral ➔ Woodlands CIQ) showing only available seats._\n\n"
+                        "• `/scrap-day/YYYYMMDD-departure-arrival`\n"
+                        "  _Generates a PDF for a specific date and route. Examples:_\n"
+                        "  `/scrap-day/20261114-woodlands-tebrau`\n"
+                        "  `/scrap-day/20261115-tebrau-woodlands`\n"
+                        "  `/scrap-day/20270207-jb-woodlands`\n\n"
+                        "📌 *Status & Monitoring:*\n"
+                        "• `/status` — View which dates/trains have been booked so far."
                     )
                     send_telegram(help_msg)
         except Exception:
