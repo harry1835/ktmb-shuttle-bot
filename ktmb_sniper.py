@@ -138,40 +138,44 @@ def get_next_weekend_dates(weeks_ahead: int = 0) -> tuple[str, str]:
 
 
 def ensure_logged_in(page: Page, email: str, password: str):
-    """Ensure the user is logged into KITS on shuttleonline.ktmb.com.my."""
-    print("[*] Navigating to KTMB Shuttle portal...")
-    page.goto(SHUTTLE_URL, wait_until="domcontentloaded")
+    """
+     Handle KTMB's cross-domain SSO (`online.ktmb.com.my/Account/Login?q=...`)
+     when redirected from `.btn-login` on `/ShuttleTrip`.
+    """
+    if "/Account/Login" not in page.url:
+        return
 
-    login_link = page.locator("a[href='/Account/Login']")
-    if login_link.count() > 0 and login_link.first.is_visible():
-        print("[*] Session not logged in. Navigating to Login page...")
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    print(f"[*] On KTMB SSO Login page ({page.url[:60]}...)...")
+    if email and password and email != "your_email@example.com":
+        print(f"[*] Submitting KITS login for {email}...")
+        page.fill("#Email", email)
+        page.fill("#Password", password)
+        page.click("#LoginButton")
+        page.wait_for_load_state("domcontentloaded")
+        page.wait_for_timeout(1500)
 
-        if email and password and email != "your_email@example.com":
-            print(f"[*] Submitting KITS login for {email}...")
-            page.fill("#Email", email)
-            page.fill("#Password", password)
-            page.click("#LoginButton")
-            page.wait_for_load_state("networkidle")
-        else:
-            vnc_url = os.getenv("VNC_PUBLIC_URL", "")
-            notify(
-                "KTMB Bot Login Needed",
-                f"Please log in to your KITS account in the browser. {vnc_url}",
-                page=page,
-            )
-
-        try:
-            page.wait_for_function(
-                "() => !document.querySelector(\"a[href='/Account/Login']\") && window.location.pathname !== '/Account/Login'",
-                timeout=120_000,
-            )
-            print("[+] Login successful!")
-        except PlaywrightTimeoutError:
-            notify("KTMB Login Failed", "Login timed out. Check KTMB_EMAIL / KTMB_PASSWORD in .env.", page=page)
-            sys.exit(1)
+        # Check if login modal reported an error (e.g., Incorrect email or password)
+        err_modal = page.locator("#validationSummaryModalBody")
+        if err_modal.count() > 0 and err_modal.is_visible():
+            err_text = err_modal.inner_text().strip()
+            if err_text:
+                notify("KTMB Login Error", f"KITS rejected login: {err_text}", page=page)
+                sys.exit(1)
     else:
-        print("[+] Already logged in via persistent browser session!")
+        vnc_url = os.getenv("VNC_PUBLIC_URL", "")
+        notify(
+            "KTMB Bot Login Needed",
+            f"Please log in to your KITS account in the browser. {vnc_url}",
+            page=page,
+        )
+
+    try:
+        page.wait_for_url("**/ShuttleTrip**", timeout=120_000)
+        wait_for_trips_loaded(page)
+        print("[+] SSO Login successful! Returned to /ShuttleTrip with active session!")
+    except PlaywrightTimeoutError:
+        notify("KTMB Login Failed", f"Login timed out at URL: {page.url}. Check credentials in .env.", page=page)
+        sys.exit(1)
 
 
 def wait_for_trips_loaded(page: Page, timeout_ms: int = 15_000):
@@ -198,15 +202,17 @@ def submit_search(
     return_date: str = "",
     pax: int = 1,
 ):
-    """Fill the KTMB Shuttle search form and navigate to /ShuttleTrip."""
-    if "/Home/Shuttle" not in page.url:
-        page.goto(SHUTTLE_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(500)
+    """Fill the KTMB Shuttle search form and navigate to /ShuttleTrip (no login required to poll seats!)."""
+    print(f"[*] Navigating to {SHUTTLE_URL} for search...")
+    page.goto(SHUTTLE_URL, wait_until="domcontentloaded")
+    page.wait_for_selector("#FromStationId", state="visible", timeout=15_000)
+    page.wait_for_timeout(400)
 
     current_from = page.input_value("#FromStationId").strip().upper()
     if current_from != origin.upper():
         print(f"[*] Swapping terminal direction to: {origin} -> {destination}")
         page.evaluate("SwapFromToTerminal()")
+        page.wait_for_timeout(200)
 
     print(
         f"[*] Searching: {origin} -> {destination} | Depart: {onward_date} | Return: {return_date or 'One-Way'} | Pax: {pax}"
@@ -218,11 +224,15 @@ def submit_search(
             const retInput = document.getElementById("ReturnDate");
             if (onInput) onInput.value = onward;
             if (retInput) retInput.value = ret;
+            if (window.jQuery && $('#theForm').length) {
+                $('#theForm').submit();
+            } else {
+                document.getElementById('btnSubmit').click();
+            }
         }""",
         [onward_date, return_date],
     )
 
-    page.click("#btnSubmit")
     page.wait_for_url("**/ShuttleTrip**", timeout=30_000)
     wait_for_trips_loaded(page)
 
@@ -256,7 +266,8 @@ def find_matching_train_button(
 ):
     """
     Scan `.DepartSection` or `.ReturnSection` for the first available train matching `preferred_times`.
-    Returns `(button_locator, time_str, seats_avail)` or `(None, None, max_seen_seats)`.
+    Works whether logged in (`.btn-seat-layout`) OR not logged in yet (`.btn-login`)!
+    Returns `(button_locator, time_str, seats_avail, is_login_btn)` or `(None, None, max_seen_seats, False)`.
     """
     max_seen = 0
     for time_str in preferred_times:
@@ -272,15 +283,20 @@ def find_matching_train_button(
         seats_avail = int(seats_match.group(1)) if seats_match else 0
         max_seen = max(max_seen, seats_avail)
 
-        btn = row_el.locator(".btn-seat-layout:not(.disabled)")
-        if seats_avail >= min_seats_required and btn.count() > 0:
+        if seats_avail >= min_seats_required:
             train_name = row_el.locator("td").nth(0).inner_text().strip()
-            print(f"[+] FOUND AVAILABLE TRAIN: {train_name} at {time_str} ({seats_avail} seats left!)")
-            return btn.first, time_str, seats_avail
+            select_btn = row_el.locator(".btn-seat-layout:not(.disabled)")
+            login_btn = row_el.locator(".btn-login")
+            if select_btn.count() > 0:
+                print(f"[+] FOUND AVAILABLE TRAIN: {train_name} at {time_str} ({seats_avail} seats left!)")
+                return select_btn.first, time_str, seats_avail, False
+            elif login_btn.count() > 0:
+                print(f"[+] FOUND AVAILABLE TRAIN (unauthenticated): {train_name} at {time_str} ({seats_avail} seats left!)")
+                return login_btn.first, time_str, seats_avail, True
         else:
             print(f"    [-] {time_str}: {seats_avail} seats (need >= {min_seats_required})")
 
-    return None, None, max_seen
+    return None, None, max_seen, False
 
 
 def handle_recaptcha_if_prompted(page: Page):
@@ -437,6 +453,8 @@ def snipe_one_way_leg(
     payment_method: str,
     wallet_pin: str,
     pax_names: list[str],
+    email: str = "",
+    password: str = "",
 ):
     """
     Snipes `total_pax` seats for a single direction (`WOODLANDS CIQ -> JB SENTRAL` or reverse).
@@ -469,31 +487,42 @@ def snipe_one_way_leg(
             now_str = datetime.datetime.now().strftime("%H:%M:%S")
             print(f"[{now_str}] Poll #{attempt} for {target_date} ({origin} -> {destination})...")
 
-            btn, chosen_time, seats_avail = find_matching_train_button(
+            btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
                 page, ".DepartSection", times_to_check, min_seats_required=search_pax
             )
 
             # Bonus: if we need 2 tickets, split_pax is on (so we searched 1 Pax),
             # and >=2 seats suddenly dropped at once, we can book 1 now and immediately grab the 2nd!
             if btn:
-                print(f"[!] Seat found on {chosen_time} ({seats_avail} available)! Clicking Select...")
-                btn.click()
-                handle_recaptcha_if_prompted(page)
+                if is_login_btn:
+                    print(f"[!] Seat found on {chosen_time} ({seats_avail} available)! Logging in via SSO now...")
+                    btn.click()
+                    page.wait_for_url("**/Account/Login**", timeout=30_000)
+                    ensure_logged_in(page, email, password)
+                    # Re-locate actual .btn-seat-layout after SSO redirects back to /ShuttleTrip
+                    btn, chosen_time, seats_avail, _ = find_matching_train_button(
+                        page, ".DepartSection", [chosen_time], min_seats_required=search_pax
+                    )
 
-                proceed_btn = page.locator(".btn-passenger")
-                if proceed_btn.count() > 0 and proceed_btn.is_visible():
-                    proceed_btn.click()
+                if btn:
+                    print(f"[!] Clicking Select on {chosen_time} ({seats_avail} available)...")
+                    btn.click()
+                    handle_recaptcha_if_prompted(page)
 
-                current_pax_match = [pax_names[booked_so_far]] if booked_so_far < len(pax_names) else None
-                ok = automate_passenger_and_checkout(page, payment_method, wallet_pin, current_pax_match)
-                if ok:
-                    booked_so_far += search_pax
-                    leg_state["booked_pax"] = booked_so_far
-                    leg_state["locked_train_time"] = chosen_time
-                    state[leg_key] = leg_state
-                    save_state(state)
-                    print(f"[+] Booked {booked_so_far}/{total_pax} for {leg_key} at {chosen_time}!")
-                break
+                    proceed_btn = page.locator(".btn-passenger")
+                    if proceed_btn.count() > 0 and proceed_btn.is_visible():
+                        proceed_btn.click()
+
+                    current_pax_match = [pax_names[booked_so_far]] if booked_so_far < len(pax_names) else None
+                    ok = automate_passenger_and_checkout(page, payment_method, wallet_pin, current_pax_match)
+                    if ok:
+                        booked_so_far += search_pax
+                        leg_state["booked_pax"] = booked_so_far
+                        leg_state["locked_train_time"] = chosen_time
+                        state[leg_key] = leg_state
+                        save_state(state)
+                        print(f"[+] Booked {booked_so_far}/{total_pax} for {leg_key} at {chosen_time}!")
+                    break
 
             attempt += 1
             time.sleep(poll_interval)
@@ -563,8 +592,6 @@ def main():
         )
         page = context.pages[0] if context.pages else context.new_page()
 
-        ensure_logged_in(page, email, password)
-
         if args.wait_for_drop:
             print("[*] Waiting for 08:29:55 AM ticket release window...")
             while True:
@@ -588,6 +615,8 @@ def main():
                 payment_method=payment_method,
                 wallet_pin=wallet_pin,
                 pax_names=pax_names,
+                email=email,
+                password=password,
             )
 
         if args.mode in ("auto_weekend", "single_sun"):
@@ -604,6 +633,8 @@ def main():
                 payment_method=payment_method,
                 wallet_pin=wallet_pin,
                 pax_names=pax_names,
+                email=email,
+                password=password,
             )
 
         if args.mode == "roundtrip":
@@ -611,20 +642,26 @@ def main():
             attempt = 1
             while True:
                 print(f"\n[Roundtrip Poll #{attempt}] Checking {sat_date} & {sun_date} ({total_pax} Pax)...")
-                sat_btn, sat_time, _ = find_matching_train_button(page, ".DepartSection", sat_times, total_pax)
-                sun_btn, sun_time, _ = find_matching_train_button(page, ".ReturnSection", sun_times, total_pax)
+                sat_btn, sat_time, _, sat_is_login = find_matching_train_button(page, ".DepartSection", sat_times, total_pax)
+                sun_btn, sun_time, _, _ = find_matching_train_button(page, ".ReturnSection", sun_times, total_pax)
                 if sat_btn and sun_btn:
-                    sat_btn.click()
-                    page.wait_for_timeout(300)
-                    sun_btn, _, _ = find_matching_train_button(page, ".ReturnSection", [sun_time], total_pax)
-                    if sun_btn:
-                        sun_btn.click()
-                        handle_recaptcha_if_prompted(page)
-                        proceed_btn = page.locator(".btn-passenger")
-                        if proceed_btn.count() > 0 and proceed_btn.is_visible():
-                            proceed_btn.click()
-                        automate_passenger_and_checkout(page, payment_method, wallet_pin, pax_names)
-                        break
+                    if sat_is_login:
+                        sat_btn.click()
+                        page.wait_for_url("**/Account/Login**", timeout=30_000)
+                        ensure_logged_in(page, email, password)
+                        sat_btn, sat_time, _, _ = find_matching_train_button(page, ".DepartSection", [sat_time], total_pax)
+                    if sat_btn:
+                        sat_btn.click()
+                        page.wait_for_timeout(300)
+                        sun_btn, _, _, _ = find_matching_train_button(page, ".ReturnSection", [sun_time], total_pax)
+                        if sun_btn:
+                            sun_btn.click()
+                            handle_recaptcha_if_prompted(page)
+                            proceed_btn = page.locator(".btn-passenger")
+                            if proceed_btn.count() > 0 and proceed_btn.is_visible():
+                                proceed_btn.click()
+                            automate_passenger_and_checkout(page, payment_method, wallet_pin, pax_names)
+                            break
                 attempt += 1
                 time.sleep(args.interval)
                 if attempt % 20 == 0:
