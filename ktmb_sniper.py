@@ -681,6 +681,9 @@ def scan_and_snipe_all_dates(
     pax_names: list[str],
     email: str = "",
     password: str = "",
+    single_sweep: bool = False,
+    is_manual_date: bool = False,
+    max_weeks: int = 36,
 ):
     """
     Continuously scans through `candidate_dates` (all upcoming Sundays or Saturdays
@@ -690,10 +693,16 @@ def scan_and_snipe_all_dates(
     cycle = 1
 
     while True:
+        if not is_manual_date:
+            weekday = 5 if "SAT" in leg_prefix else 6
+            active_dates = get_upcoming_weekday_dates(weekday, max_weeks=max_weeks)
+        else:
+            active_dates = candidate_dates
+
         state = load_state()
         # Filter out dates that already have total_pax booked
         pending_dates = [
-            d for d in candidate_dates if int(state.get(f"{leg_prefix}_{d}", {}).get("booked_pax", 0)) < total_pax
+            d for d in active_dates if int(state.get(f"{leg_prefix}_{d}", {}).get("booked_pax", 0)) < total_pax
         ]
         if not pending_dates:
             print(f"[+] All target dates for {leg_prefix} have {total_pax}/{total_pax} tickets booked!")
@@ -786,6 +795,8 @@ def scan_and_snipe_all_dates(
         cycle += 1
         print(f"[*] Finished full calendar sweep. Waiting {poll_interval}s before next sweep...")
         time.sleep(poll_interval)
+        if single_sweep:
+            return
 
 
 def register_telegram_bot_commands(token: str):
@@ -1018,7 +1029,7 @@ def main():
     )
     parser.add_argument("--sat-date", default=os.getenv("TARGET_SATURDAY_DATE", ""), help="Optional single Saturday date override")
     parser.add_argument("--sun-date", default=os.getenv("TARGET_SUNDAY_DATE", ""), help="Optional single Sunday date override")
-    parser.add_argument("--max-weeks", type=int, default=int(os.getenv("MAX_SCAN_WEEKS", "22")), help="Max weeks ahead to scan until end of released calendar")
+    parser.add_argument("--max-weeks", type=int, default=int(os.getenv("MAX_SCAN_WEEKS", "36")), help="Max weeks ahead to scan until end of released calendar")
     parser.add_argument("--interval", type=float, default=float(os.getenv("POLL_INTERVAL_SECONDS", "4")), help="Pause in seconds between full calendar sweeps")
     parser.add_argument("--wait-for-drop", action="store_true", help="Wait until 08:29:55 AM SGT/MYT before starting high-speed sniping")
     args = parser.parse_args()
@@ -1090,6 +1101,9 @@ def main():
                 pax_names=pax_names,
                 email=email,
                 password=password,
+                single_sweep=False,
+                is_manual_date=bool(args.sun_date),
+                max_weeks=args.max_weeks,
             )
         elif args.mode == "single_sat":
             scan_and_snipe_all_dates(
@@ -1107,6 +1121,9 @@ def main():
                 pax_names=pax_names,
                 email=email,
                 password=password,
+                single_sweep=False,
+                is_manual_date=bool(args.sat_date),
+                max_weeks=args.max_weeks,
             )
         else:  # auto_weekend
             # Alternate sweeping all Saturdays and all Sundays
@@ -1116,7 +1133,7 @@ def main():
                     leg_prefix="SAT",
                     origin="WOODLANDS CIQ",
                     destination="JB SENTRAL",
-                    candidate_dates=sat_dates[:1],
+                    candidate_dates=sat_dates,
                     preferred_times=sat_times,
                     total_pax=total_pax,
                     split_pax=split_pax,
@@ -1126,13 +1143,16 @@ def main():
                     pax_names=pax_names,
                     email=email,
                     password=password,
+                    single_sweep=True,
+                    is_manual_date=bool(args.sat_date),
+                    max_weeks=args.max_weeks,
                 )
                 scan_and_snipe_all_dates(
                     page=page,
                     leg_prefix="SUN",
                     origin="JB SENTRAL",
                     destination="WOODLANDS CIQ",
-                    candidate_dates=sun_dates[:1],
+                    candidate_dates=sun_dates,
                     preferred_times=sun_times,
                     total_pax=total_pax,
                     split_pax=split_pax,
@@ -1142,6 +1162,9 @@ def main():
                     pax_names=pax_names,
                     email=email,
                     password=password,
+                    single_sweep=True,
+                    is_manual_date=bool(args.sun_date),
+                    max_weeks=args.max_weeks,
                 )
 
 
