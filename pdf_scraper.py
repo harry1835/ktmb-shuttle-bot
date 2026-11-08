@@ -322,6 +322,15 @@ def generate_pdf_report(
         page.pdf(path=str(pdf_path), format="A4", print_background=True)
         browser.close()
 
+    # Auto-clean older reports: keep only the most recent 10 PDFs
+    try:
+        all_pdfs = sorted(REPORTS_DIR.glob("*.pdf"), key=lambda f: f.stat().st_mtime)
+        if len(all_pdfs) > 10:
+            for old_pdf in all_pdfs[:-10]:
+                old_pdf.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     print(f"[+] PDF report generated at: {pdf_path}")
     return pdf_path
 

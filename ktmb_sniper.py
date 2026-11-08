@@ -97,6 +97,15 @@ def notify(title: str, message: str, page: Page | None = None, sound: bool = Tru
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             photo_path = SCREENSHOT_DIR / f"alert_{ts}.png"
             page.screenshot(path=str(photo_path))
+
+            # Auto-clean older screenshots: keep only the most recent 20 screenshots
+            try:
+                all_shots = sorted(SCREENSHOT_DIR.glob("*.png"), key=lambda f: f.stat().st_mtime)
+                if len(all_shots) > 20:
+                    for old_file in all_shots[:-20]:
+                        old_file.unlink(missing_ok=True)
+            except Exception:
+                pass
         except Exception:
             photo_path = None
 
