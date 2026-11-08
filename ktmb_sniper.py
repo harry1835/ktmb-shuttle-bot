@@ -493,38 +493,73 @@ def automate_passenger_and_checkout(
     page.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(1000)
 
-    notify(
-        "KTMB Seat Locked!",
-        f"Locked {date_label} ({train_time}) in cart for 10 mins! Selecting passenger {passenger_matches} & paying...",
-        page=page,
-    )
-
+    # 1. Fill Passenger 1: Check "I am travelling"
     try:
-        if passenger_matches:
-            for p_match in passenger_matches:
-                if not p_match:
-                    continue
-                matched_el = page.locator(
-                    f"label:has-text('{p_match}'), option:has-text('{p_match}'), tr:has-text('{p_match}')"
-                )
-                if matched_el.count() > 0:
-                    matched_el.first.click()
-                    page.wait_for_timeout(400)
+        travelling_cb = page.locator("input[type='checkbox']").first
+        if travelling_cb.count() > 0 and not travelling_cb.is_checked():
+            print("[*] Checking 'I am travelling' for Passenger 1...")
+            travelling_cb.check(force=True)
+            page.wait_for_timeout(800)
 
-        fav_btns = page.locator(
-            ".btn-favorite, .select-passenger, button:has-text('Favorite'), a:has-text('Favorite'), input[type='checkbox'].passenger-select, select[id*='Passenger'], select[id*='Favourite']"
-        )
-        if fav_btns.count() > 0:
-            first_el = fav_btns.first
-            tag = first_el.evaluate("el => el.tagName.toLowerCase()")
-            if tag == "select":
-                first_el.select_option(index=1)
-            else:
-                first_el.click()
-            page.wait_for_timeout(600)
+        # Fallback click text if not checked
+        if travelling_cb.count() > 0 and not travelling_cb.is_checked():
+            page.locator("text='I am travelling'").first.click(force=True)
+            page.wait_for_timeout(800)
     except Exception as e:
-        print(f"[*] Passenger auto-fill note: {e}")
+        print(f"[*] 'I am travelling' checkbox note: {e}")
 
+    # 2. Fill Passenger 2 (and other passengers) via "Select Friends and Family" dropdown
+    try:
+        all_selects = page.locator("select").all()
+        for sel in all_selects:
+            try:
+                opts_text = [t.strip() for t in sel.locator("option").all_inner_texts()]
+                if any("friends" in o.lower() or "family" in o.lower() for o in opts_text):
+                    print(f"[*] Found Friends & Family dropdown with options: {opts_text}")
+                    selected = False
+                    for target_name in (passenger_matches or []):
+                        if not target_name:
+                            continue
+                        for idx, opt_label in enumerate(opts_text):
+                            if target_name.lower() in opt_label.lower():
+                                sel.select_option(index=idx)
+                                sel.dispatch_event("change")
+                                print(f"[+] Selected '{opt_label}' for passenger {target_name}")
+                                selected = True
+                                break
+                        if selected:
+                            break
+
+                    if not selected and len(opts_text) > 1:
+                        sel.select_option(index=1)
+                        sel.dispatch_event("change")
+                        print(f"[+] Selected default option #1 ('{opts_text[1]}') from dropdown")
+                    page.wait_for_timeout(400)
+            except Exception as ex:
+                print(f"[*] Friends & Family dropdown item error: {ex}")
+    except Exception as e:
+        print(f"[*] Friends and Family selection note: {e}")
+
+    # 3. Ensure "Ticket type *" (Adult / Dewasa) is selected for all passengers
+    try:
+        all_selects = page.locator("select").all()
+        for sel in all_selects:
+            try:
+                opts_text = [t.strip() for t in sel.locator("option").all_inner_texts()]
+                if any("adult" in o.lower() or "dewasa" in o.lower() for o in opts_text):
+                    for idx, opt_label in enumerate(opts_text):
+                        if "adult" in opt_label.lower() or "dewasa" in opt_label.lower():
+                            sel.select_option(index=idx)
+                            sel.dispatch_event("change")
+                            print(f"[+] Selected Ticket Type '{opt_label}'")
+                            break
+                    page.wait_for_timeout(300)
+            except Exception as ex:
+                print(f"[*] Ticket type item error: {ex}")
+    except Exception as e:
+        print(f"[*] Ticket type selection note: {e}")
+
+    # 4. Check any Terms and Conditions checkboxes
     try:
         tnc_boxes = page.locator(
             "input[type='checkbox'][id*='Term'], input[type='checkbox'][name*='Term'], input[type='checkbox'][id*='Agree']"
@@ -532,46 +567,84 @@ def automate_passenger_and_checkout(
         for i in range(tnc_boxes.count()):
             box = tnc_boxes.nth(i)
             if box.is_visible() and not box.is_checked():
-                box.check()
+                box.check(force=True)
     except Exception:
         pass
 
+    page.wait_for_timeout(800)
+
+    # Send screenshot with filled passenger details!
+    notify(
+        "KTMB Passenger Details Filled",
+        f"Locked {date_label} ({train_time}) in cart for 10 mins! Passenger details filled for {passenger_matches}. Proceeding to payment...",
+        page=page,
+    )
+
+    # 5. Click the yellow "PROCEED TO PAYMENT" button
+    print("[*] Clicking yellow 'PROCEED TO PAYMENT' button...")
+    try:
+        proceed_btn = page.locator(
+            "button:has-text('PROCEED TO PAYMENT'), a:has-text('PROCEED TO PAYMENT'), .btn:has-text('PROCEED TO PAYMENT'), input[value*='PROCEED TO PAYMENT'], button:has-text('PROCEED'), a:has-text('PROCEED'), #btnProceed, #btnSubmit"
+        ).first
+        if proceed_btn.count() > 0 and proceed_btn.is_visible():
+            proceed_btn.click()
+            print("[+] Clicked PROCEED TO PAYMENT!")
+    except Exception as e:
+        print(f"[!] Error clicking PROCEED TO PAYMENT: {e}")
+
+    # Wait for navigation to payment page
+    try:
+        page.wait_for_url("**/Payment**|**/Checkout**|**/Cart**|**/Summary**", timeout=20_000)
+        print(f"[+] Navigated to payment page: {page.url}")
+    except Exception as e:
+        print(f"[*] Navigation to payment page note: {e}")
+
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(1500)
+
+    # 6. Proceed to KTM Wallet checkout on payment page
     if payment_method.upper() == "KTM_WALLET":
         print("[*] Proceeding with automated KTM Wallet checkout...")
         try:
-            pay_proceed = page.locator(
-                "button:has-text('PROCEED'), button:has-text('Proceed'), button:has-text('Pay'), input[type='submit'][value*='Proceed'], #btnProceed, #btnSubmit"
-            )
-            if pay_proceed.count() > 0 and pay_proceed.first.is_visible():
-                pay_proceed.first.click()
-                page.wait_for_timeout(1500)
-
             wallet_opt = page.locator(
-                "text=/KTM Wallet/i, input[value*='Wallet'], label:has-text('KTM Wallet'), .payment-method:has-text('Wallet')"
-            )
-            if wallet_opt.count() > 0 and wallet_opt.first.is_visible():
-                wallet_opt.first.click()
-                page.wait_for_timeout(500)
+                "text=/KTM Wallet/i, input[value*='Wallet'], label:has-text('KTM Wallet'), label:has-text('Wallet'), .payment-method:has-text('Wallet'), div:has-text('KTM Wallet')"
+            ).first
+            if wallet_opt.count() > 0 and wallet_opt.is_visible():
+                print("[*] Selecting KTM Wallet...")
+                wallet_opt.click()
+                page.wait_for_timeout(800)
+
+                # Check payment T&C if any
+                ptnc = page.locator("input[type='checkbox']")
+                for i in range(ptnc.count()):
+                    cb = ptnc.nth(i)
+                    if cb.is_visible() and not cb.is_checked():
+                        cb.check(force=True)
 
                 if wallet_pin:
-                    pin_input = page.locator("input[type='password'], input[id*='Pin'], input[name*='Pin']")
-                    if pin_input.count() > 0 and pin_input.first.is_visible():
-                        pin_input.first.fill(wallet_pin)
+                    pin_input = page.locator("input[type='password'], input[id*='Pin' i], input[name*='Pin' i]").first
+                    if pin_input.count() > 0 and pin_input.is_visible():
+                        print("[*] Entering KTM Wallet PIN...")
+                        pin_input.fill(wallet_pin)
+                        page.wait_for_timeout(300)
 
-                final_pay_btn = page.locator("button:has-text('Pay'), button:has-text('Confirm'), #btnPay")
-                if final_pay_btn.count() > 0 and final_pay_btn.first.is_visible():
-                    final_pay_btn.first.click()
-                    page.wait_for_timeout(3000)
+                final_pay_btn = page.locator(
+                    "button:has-text('Pay'), button:has-text('Bayar'), button:has-text('Confirm'), a:has-text('Pay'), input[value*='Pay'], #btnPay"
+                ).first
+                if final_pay_btn.count() > 0 and final_pay_btn.is_visible():
+                    print("[*] Submitting final payment...")
+                    final_pay_btn.click()
+                    page.wait_for_timeout(4000)
                     notify(
-                        "KTMB Checkout Triggered",
-                        f"KTM Wallet payment submitted for {date_label} ({train_time})!",
+                        "🎉 KTMB Payment Completed!",
+                        f"KTM Wallet payment successfully processed for {date_label} ({train_time})!",
                         page=page,
                     )
                     return True
         except Exception as e:
             print(f"[!] Partial auto-checkout note: {e}")
 
-    vnc_url = os.getenv("VNC_PUBLIC_URL", "")
+    vnc_url = get_vnc_url()
     notify(
         "Complete Checkout",
         f"Seat for {date_label} ({train_time}) is held in cart for 10 mins. Finish checkout at {vnc_url}",
