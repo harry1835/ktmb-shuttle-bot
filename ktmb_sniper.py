@@ -542,7 +542,10 @@ def scan_and_snipe_all_dates(
                     if proceed_btn.count() > 0 and proceed_btn.is_visible():
                         proceed_btn.click()
 
-                    current_pax_match = [pax_names[booked_so_far]] if booked_so_far < len(pax_names) else None
+                    if search_pax >= 2:
+                        current_pax_match = [p for p in pax_names if p]
+                    else:
+                        current_pax_match = [pax_names[booked_so_far]] if booked_so_far < len(pax_names) else None
                     ok = automate_passenger_and_checkout(
                         page,
                         payment_method,
@@ -557,7 +560,10 @@ def scan_and_snipe_all_dates(
                         leg_state["locked_train_time"] = chosen_time
                         state[leg_key] = leg_state
                         save_state(state)
-                        print(f"[+] Booked {booked_so_far}/{total_pax} for {target_date} at {chosen_time}!")
+                        print(
+                            f"[+] Booked {booked_so_far}/{total_pax} for {target_date} at {chosen_time}! "
+                            f"{'Week complete - will not buy another slot for this date!' if booked_so_far >= total_pax else ''}"
+                        )
                     # Re-initialize search session on next loop after a checkout attempt
                     break
 
@@ -588,7 +594,7 @@ def main():
     email = os.getenv("KTMB_EMAIL", "")
     password = os.getenv("KTMB_PASSWORD", "")
     total_pax = int(os.getenv("PAX_COUNT", "2"))
-    split_pax = os.getenv("SPLIT_PAX_SNIPE", "true").lower() in ("1", "true", "yes")
+    split_pax = os.getenv("SPLIT_PAX_SNIPE", "false").lower() in ("1", "true", "yes")
     sat_times = [t.strip() for t in os.getenv("SATURDAY_PREFERRED_TIMES", "12:30,13:45").split(",") if t.strip()]
     sun_times = [t.strip() for t in os.getenv("SUNDAY_PREFERRED_TIMES", "20:15,19:00,21:30").split(",") if t.strip()]
     payment_method = os.getenv("PAYMENT_METHOD", "KTM_WALLET")
