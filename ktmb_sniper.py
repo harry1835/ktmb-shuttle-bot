@@ -260,7 +260,14 @@ def switch_date_in_place(page: Page, target_date: str, return_date: str = "") ->
         }""",
         [target_date, return_date],
     )
-    page.wait_for_timeout(500)
+    try:
+        page.wait_for_function(
+            f"() => {{ const el = document.querySelector('.depart-date-input'); return el && el.innerText.includes('{target_date}'); }}",
+            timeout=12_000,
+        )
+    except Exception:
+        pass
+    page.wait_for_timeout(300)
     wait_for_trips_loaded(page)
 
     # Check if trains are actually released on this date (released dates have > 3 train rows with data-hourminute)

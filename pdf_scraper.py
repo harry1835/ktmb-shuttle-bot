@@ -141,7 +141,14 @@ def generate_pdf_report(
         for idx, (ktmb_date, display_label) in enumerate(date_tuples):
             if idx > 0:
                 page.evaluate(f"ChangeDate($(id_formSearchData).val(), '{ktmb_date}', false, 1)")
-                page.wait_for_timeout(600)
+                try:
+                    page.wait_for_function(
+                        f"() => {{ const el = document.querySelector('.depart-date-input'); return el && el.innerText.includes('{ktmb_date}'); }}",
+                        timeout=12_000,
+                    )
+                except Exception:
+                    pass
+                page.wait_for_timeout(300)
 
             rows = page.locator(".depart-trips tr[data-hourminute]")
             count = rows.count()
