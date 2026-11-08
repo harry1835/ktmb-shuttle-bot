@@ -711,6 +711,7 @@ def register_telegram_bot_commands(token: str):
     try:
         commands = [
             {"command": "help", "description": "Show available commands & examples"},
+            {"command": "buy", "description": "Instant buy: /buy YYYYMMDD HH:MM (e.g. /buy 20270221 22:45)"},
             {"command": "scrap_saturday_woodlands_tebrau", "description": "PDF report for all Saturdays (Woodlands -> JB)"},
             {"command": "scrap_sunday_tebrau_woodlands", "description": "PDF report for all Sundays (JB -> Woodlands)"},
             {"command": "status", "description": "Show current bot booking state"},
@@ -720,6 +721,125 @@ def register_telegram_bot_commands(token: str):
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         print(f"[*] Note registering bot commands: {e}")
+
+
+def parse_buy_command(text: str):
+    """Parses /buy commands into (ktmb_date, display_date, time_fmt, dep, arr)."""
+    cleaned = text.strip()
+    match = re.search(r"(\d{8})[-_\s]+(\d{2}:?\d{2})(?:[-_\s]+([a-zA-Z]+)[-_]([a-zA-Z]+))?", cleaned)
+    if not match:
+        return None
+    raw_date, raw_time, raw_dep, raw_arr = match.group(1), match.group(2).replace(":", ""), match.group(3), match.group(4)
+    time_fmt = f"{raw_time[:2]}:{raw_time[2:]}"
+    y, m, d = int(raw_date[:4]), int(raw_date[4:6]), int(raw_date[6:8])
+    dt = datetime.date(y, m, d)
+    ktmb_date = f"{dt.day} {dt.strftime('%b %Y')}"
+    display_date = dt.strftime("%a, %d %b %Y")
+
+    if raw_dep and raw_arr:
+        dep = "JB SENTRAL" if any(k in raw_dep.lower() for k in ["tebrau", "jb", "johor"]) else "WOODLANDS CIQ"
+        arr = "WOODLANDS CIQ" if dep == "JB SENTRAL" else "JB SENTRAL"
+    else:
+        if dt.weekday() == 6 or int(raw_time[:2]) >= 17:
+            dep, arr = "JB SENTRAL", "WOODLANDS CIQ"
+        else:
+            dep, arr = "WOODLANDS CIQ", "JB SENTRAL"
+
+    return ktmb_date, display_date, time_fmt, dep, arr
+
+
+def execute_direct_buy(text: str, chat_id: str | None = None):
+    """Executes an instant on-demand ticket purchase triggered from Telegram."""
+    parsed = parse_buy_command(text)
+    if not parsed:
+        send_telegram(
+            "❌ *Invalid /buy format.*\n\n"
+            "Format:\n`/buy YYYYMMDD HH:MM`\n\n"
+            "Examples:\n"
+            "• `/buy 20270221 22:45`\n"
+            "• `/buy 20270221 22:45 tebrau-woodlands`\n"
+            "• `/buy-day/20261114-1230-woodlands-tebrau`"
+        )
+        return
+
+    ktmb_date, display_date, time_fmt, origin, destination = parsed
+    email = os.getenv("KTMB_EMAIL", "")
+    password = os.getenv("KTMB_PASSWORD", "")
+    total_pax = int(os.getenv("PAX_COUNT", "2"))
+    payment_method = os.getenv("PAYMENT_METHOD", "KTM_WALLET")
+    wallet_pin = os.getenv("KTM_WALLET_PIN", "")
+    pax_names = [
+        os.getenv("PASSENGER_1_MATCH", "").strip(),
+        os.getenv("PASSENGER_2_MATCH", "").strip(),
+    ]
+    pax_names = [p for p in pax_names if p]
+    headless = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
+
+    send_telegram(
+        f"⚡ *Processing Instant Buy Request:*\n"
+        f"• Date: *{display_date}*\n"
+        f"• Train Time: *{time_fmt}*\n"
+        f"• Route: *{origin} ➔ {destination}*\n"
+        f"• Passengers: *{total_pax} Pax* ({pax_names})\n\n"
+        f"Checking availability & booking via KTM Wallet now..."
+    )
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+
+        submit_search(page, origin, destination, ktmb_date, "", pax=total_pax)
+
+        btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
+            page, ".DepartSection", [time_fmt], min_seats_required=total_pax, date_label=ktmb_date
+        )
+
+        if not btn:
+            send_telegram(
+                f"❌ *Instant Buy Unavailable:*\n"
+                f"{display_date} at {time_fmt} has fewer than {total_pax} seats available right now.\n"
+                f"The 24/7 background sniper will continue monitoring for drops!"
+            )
+            browser.close()
+            return
+
+        if is_login_btn:
+            print(f"[!] Logging in via SSO for direct buy...")
+            btn.click()
+            page.wait_for_url("**/Account/Login**", timeout=30_000)
+            ensure_logged_in(page, email, password)
+            btn, chosen_time, seats_avail, _ = find_matching_train_button(
+                page, ".DepartSection", [time_fmt], min_seats_required=total_pax, date_label=ktmb_date
+            )
+
+        if btn:
+            print(f"[!] Clicking Select for direct buy: {display_date} {chosen_time} ({seats_avail} seats)...")
+            btn.click()
+            nav_ok = reserve_and_wait_passenger_page(page, timeout_sec=180)
+            if not nav_ok:
+                send_telegram(f"❌ Timed out waiting for reCAPTCHA/reservation on {display_date} at {time_fmt}.")
+                browser.close()
+                return
+
+            ok = automate_passenger_and_checkout(
+                page, payment_method, wallet_pin, pax_names, date_label=ktmb_date, train_time=chosen_time
+            )
+            if ok:
+                state = load_state()
+                prefix = "SUN" if "JB" in origin else "SAT"
+                leg_key = f"{prefix}_{ktmb_date}"
+                state[leg_key] = {"booked_pax": total_pax, "locked_train_time": chosen_time}
+                save_state(state)
+                notify(
+                    "🎉 Instant Purchase Confirmed!",
+                    f"Successfully booked {total_pax} tickets for {display_date} at {chosen_time} ({origin} ➔ {destination}) via KTM Wallet!",
+                    page=page,
+                )
+
+        browser.close()
 
 
 def start_telegram_command_listener():
@@ -752,7 +872,14 @@ def start_telegram_command_listener():
                 # Normalize command if bot username is appended (e.g. /help@MyBot)
                 cmd_clean = text.split("@")[0].lower()
 
-                if cmd_clean.startswith("/scrap"):
+                if cmd_clean.startswith("/buy"):
+                    print(f"[*] Received Telegram /buy command: '{text}' from chat {chat_id}")
+                    threading.Thread(
+                        target=execute_direct_buy,
+                        args=(text, chat_id),
+                        daemon=True,
+                    ).start()
+                elif cmd_clean.startswith("/scrap"):
                     print(f"[*] Received Telegram command: '{text}' from chat {chat_id}")
                     send_telegram(f"⏳ Generating available seats PDF report for `{text}`... Please wait ~10-15s.")
                     threading.Thread(
@@ -770,6 +897,12 @@ def start_telegram_command_listener():
                 elif cmd_clean in ("/help", "/start"):
                     help_msg = (
                         "🤖 *KTMB Shuttle Tebrau Bot Commands*\n\n"
+                        "⚡ *Instant Buy Tickets:*\n"
+                        "• `/buy YYYYMMDD HH:MM`\n"
+                        "  _Instantly checks, locks & pays via KTM Wallet for 2 Pax. Examples:_\n"
+                        "  `/buy 20270221 22:45`\n"
+                        "  `/buy 20270207 20:15 tebrau-woodlands`\n"
+                        "  `/buy 20261114 12:30 woodlands-tebrau`\n\n"
                         "📌 *On-Demand PDF Reports:*\n"
                         "• `/scrap-saturday-woodlands-tebrau`\n"
                         "  _Generates a PDF of all released Saturdays (Woodlands CIQ ➔ JB Sentral) showing only available seats._\n\n"

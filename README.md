@@ -56,6 +56,28 @@ journalctl -u ktmb-sniper.service -f
 
 ---
 
+## ⚡ Telegram Commands
+
+### 1. Instant Ticket Buying (`/buy`)
+You can trigger an immediate booking right from Telegram without waiting for the background loop:
+```
+/buy YYYYMMDD HH:MM [optional-route]
+```
+**Examples:**
+* `/buy 20270221 22:45` — Immediately books 2 tickets on 21 Feb 2027 at 22:45 (`JB Sentral ➔ Woodlands CIQ`).
+* `/buy 20270207 20:15 tebrau-woodlands` — Immediately books 2 tickets for 7 Feb 2027 at 20:15.
+* `/buy 20261114 12:30 woodlands-tebrau` — Immediately books 2 tickets for 14 Nov 2026 at 12:30 (`Woodlands CIQ ➔ JB Sentral`).
+
+The bot will:
+1. Navigate directly to that train slot.
+2. Confirm `>= 2` seats are available.
+3. Automatically solve reCAPTCHA via Groq Whisper.
+4. Select both saved passengers (`HAU KWAN SHIAN` and `Lai Si Ying`).
+5. Pay via **KTM Wallet**.
+6. Send you an instant purchase confirmation screenshot in Telegram!
+
+---
+
 ## 📊 Telegram PDF Scraping Commands
 
 You can send commands directly into your Telegram channel or direct bot chat at any time, and the bot will scrape live availability and upload an A4 PDF report showing **only the timeslots that currently have available seats**:
