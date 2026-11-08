@@ -29,12 +29,15 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
+
+from pdf_scraper import handle_scrape_command
 
 BASE_URL = "https://shuttleonline.ktmb.com.my"
 SHUTTLE_URL = f"{BASE_URL}/Home/Shuttle"
@@ -696,8 +699,63 @@ def scan_and_snipe_all_dates(
         time.sleep(poll_interval)
 
 
+def start_telegram_command_listener():
+    """Background listener for Telegram commands (/scrap-saturday-woodlands-tebrau, etc.)."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return
+
+    print("[*] Telegram command listener started (listening for /scrap-saturday..., /scrap-day/...)")
+    last_update_id = 0
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates?timeout=25"
+            if last_update_id > 0:
+                url += f"&offset={last_update_id + 1}"
+            req = urllib.request.Request(url)
+            resp = urllib.request.urlopen(req, timeout=35)
+            data = json.loads(resp.read().decode("utf-8"))
+
+            for update in data.get("result", []):
+                last_update_id = update["update_id"]
+                msg = update.get("message") or update.get("channel_post")
+                if not msg:
+                    continue
+                text = msg.get("text", "").strip()
+                chat_id = str(msg["chat"]["id"])
+
+                if text.startswith("/scrap"):
+                    print(f"[*] Received Telegram command: '{text}' from chat {chat_id}")
+                    send_telegram(f"⏳ Generating available seats PDF report for `{text}`... Please wait ~10-15s.")
+                    threading.Thread(
+                        target=handle_scrape_command,
+                        args=(text, chat_id),
+                        daemon=True,
+                    ).start()
+                elif text in ("/help", "/start"):
+                    help_msg = (
+                        "🤖 *KTMB Shuttle Tebrau PDF Reports Bot*\n\n"
+                        "Send me any of these commands to get a live PDF of available seats:\n\n"
+                        "1️⃣ `/scrap-saturday-woodlands-tebrau`\n"
+                        "   Scrapes all released Saturdays (Woodlands ➔ JB Sentral)\n\n"
+                        "2️⃣ `/scrap-sunday-tebrau-woodlands`\n"
+                        "   Scrapes all released Sundays (JB Sentral ➔ Woodlands)\n\n"
+                        "3️⃣ `/scrap-day/YYYYMMDD-departure-arrival`\n"
+                        "   Scrapes a single date, e.g.:\n"
+                        "   `/scrap-day/20261115-woodlands-tebrau`\n"
+                        "   `/scrap-day/20261115-tebrau-woodlands`"
+                    )
+                    send_telegram(help_msg)
+        except Exception:
+            time.sleep(3)
+
+
 def main():
     load_dotenv()
+
+    # Start Telegram command listener in background thread
+    threading.Thread(target=start_telegram_command_listener, daemon=True).start()
 
     parser = argparse.ArgumentParser(description="KTMB Shuttle Tebrau Ticket Sniper & Auto-Buyer")
     parser.add_argument(

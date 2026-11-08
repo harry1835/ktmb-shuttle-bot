@@ -56,6 +56,26 @@ journalctl -u ktmb-sniper.service -f
 
 ---
 
+## 📊 Telegram PDF Scraping Commands
+
+You can send commands directly into your Telegram channel or direct bot chat at any time, and the bot will scrape live availability and upload an A4 PDF report showing **only the timeslots that currently have available seats**:
+
+1. **`/scrap-saturday-woodlands-tebrau`**
+   - Scrapes all released upcoming Saturdays for `Woodlands CIQ ➔ JB Sentral`.
+   - Sends a formatted PDF with all available timeslots & seat counts.
+
+2. **`/scrap-sunday-tebrau-woodlands`**
+   - Scrapes all released upcoming Sundays for `JB Sentral ➔ Woodlands CIQ`.
+   - Sends a formatted PDF with all available timeslots & seat counts.
+
+3. **`/scrap-day/YYYYMMDD-departure-arrival`**
+   - Scrapes a single specific date and route. Examples:
+     - `/scrap-day/20261114-woodlands-tebrau`
+     - `/scrap-day/20261115-tebrau-woodlands`
+     - `/scrap-day/20270207-jb-woodlands`
+
+---
+
 ## Manual CLI Usage
 
 You can also run [`ktmb_sniper.py`](ktmb_sniper.py) directly for specific dates or modes:
