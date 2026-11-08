@@ -4,19 +4,21 @@ KTMB Shuttle Tebrau Automated Sniper & Checkout Bot (Linux LXC & macOS Ready)
 Portal: https://shuttleonline.ktmb.com.my/Home/Shuttle
 
 Key Features:
-1. Designed for 24/7 execution inside a Linux LXC container using Xvfb + NoVNC
-   (virtual X11 display so Chromium runs with `headless=False` to evade bot detection).
-2. Telegram Bot notifications (with live screenshots) whenever a seat is locked,
-   a reCAPTCHA challenge appears, or a ticket purchase completes.
-3. Smart 2-Ticket Split Sniping (`SPLIT_PAX_SNIPE=true`):
-   - On sold-out trains, single cancelled tickets (1 seat) drop much more frequently
-     than 2 seats at once.
-   - Searches with `1 Pax` if only 1 seat is available (or `2 Pax` if >=2 are available),
-     books Passenger 1 first, and automatically loops back to book Passenger 2 on the
-     same train!
+1. Scans ALL released weekends up to the last released date on KTMB's calendar
+   (auto-detects when a future Sunday/Saturday returns 'No trip available' / 1 row
+   and wraps back to the nearest upcoming weekend).
+2. Zero-Login Fast AJAX Polling:
+   - Uses KTMB's internal `ChangeDate()` AJAX endpoint (~300ms per date) to cycle
+     through every Sunday (or Saturday) without reloading the page and without
+     logging in first (preventing KTMB's "Not allow multiple login" lock!).
+3. On-Demand Cross-Domain SSO Login & Checkout:
+   - Only logs in when a seat (>=1) is actually found on your preferred train,
+     locks the seat in cart, selects your saved KITS Favorite Passenger (`PASSENGER_1_MATCH`
+     then `PASSENGER_2_MATCH`), and triggers KTM Wallet checkout + Telegram screenshot alerts.
 4. Persistent State (`bookings_state.json`):
-   - Remembers which weekend legs and passengers have already been booked so a
-     systemd restart never double-books the same ticket.
+   - Tracks `booked_pax` and `locked_train_time` per date (e.g. `SUN_15 Nov 2026`)
+     so once a Sunday has 2/2 tickets booked, it automatically skips that Sunday
+     on future scans!
 """
 
 import argparse
@@ -53,7 +55,6 @@ def send_telegram(message: str, photo_path: Path | None = None):
 
     try:
         if photo_path and photo_path.exists():
-            # Use curl for simple multipart upload without extra dependencies
             subprocess.run(
                 [
                     "curl",
@@ -121,26 +122,44 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
-def get_next_weekend_dates(weeks_ahead: int = 0) -> tuple[str, str]:
+def format_ktmb_date(d: datetime.date) -> str:
+    """Format date as 'D MMM YYYY' without leading zero on day (e.g. '15 Nov 2026' or '7 Feb 2027')."""
+    return f"{d.day} {d.strftime('%b %Y')}"
+
+
+def get_upcoming_weekday_dates(weekday: int, max_weeks: int = 26) -> list[str]:
     """
-    Calculate the upcoming Saturday and Sunday dates formatted as 'D MMM YYYY'
-    (matching KTMB's Lightpick format, e.g., '14 Nov 2026' or '5 Dec 2026').
+    Generate upcoming dates for a specific weekday (5 = Saturday, 6 = Sunday)
+    up to `max_weeks` ahead.
     """
     today = datetime.date.today()
-    days_until_saturday = (5 - today.weekday()) % 7
-    if days_until_saturday == 0 and datetime.datetime.now().hour >= 14:
-        days_until_saturday = 7
-    target_sat = today + datetime.timedelta(days=days_until_saturday + (weeks_ahead * 7))
-    target_sun = target_sat + datetime.timedelta(days=1)
-    sat_str = f"{target_sat.day} {target_sat.strftime('%b %Y')}"
-    sun_str = f"{target_sun.day} {target_sun.strftime('%b %Y')}"
-    return sat_str, sun_str
+    days_ahead = (weekday - today.weekday()) % 7
+    if days_ahead == 0 and datetime.datetime.now().hour >= 20:
+        days_ahead = 7
+    first_date = today + datetime.timedelta(days=days_ahead)
+    return [format_ktmb_date(first_date + datetime.timedelta(days=w * 7)) for w in range(max_weeks)]
+
+
+def wait_for_trips_loaded(page: Page, timeout_ms: int = 15_000):
+    """Wait until KTMB's RenderTrip AJAX finishes loading train rows and hides the loading modal."""
+    try:
+        page.wait_for_function(
+            """() => {
+                const rows = document.querySelectorAll('.depart-trips tr');
+                const modalVisible = document.querySelector('#popupModal.show');
+                return rows.length > 0 && !modalVisible;
+            }""",
+            timeout=timeout_ms,
+        )
+    except PlaywrightTimeoutError:
+        pass
+    page.wait_for_timeout(250)
 
 
 def ensure_logged_in(page: Page, email: str, password: str):
     """
-     Handle KTMB's cross-domain SSO (`online.ktmb.com.my/Account/Login?q=...`)
-     when redirected from `.btn-login` on `/ShuttleTrip`.
+    Handle KTMB's cross-domain SSO (`online.ktmb.com.my/Account/Login?q=...`)
+    when redirected from `.btn-login` on `/ShuttleTrip`.
     """
     if "/Account/Login" not in page.url:
         return
@@ -154,7 +173,6 @@ def ensure_logged_in(page: Page, email: str, password: str):
         page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(1500)
 
-        # Check if login modal reported an error (e.g., Incorrect email or password)
         err_modal = page.locator("#validationSummaryModalBody")
         if err_modal.count() > 0 and err_modal.is_visible():
             err_text = err_modal.inner_text().strip()
@@ -178,22 +196,6 @@ def ensure_logged_in(page: Page, email: str, password: str):
         sys.exit(1)
 
 
-def wait_for_trips_loaded(page: Page, timeout_ms: int = 15_000):
-    """Wait until KTMB's RenderTrip AJAX finishes loading train rows and hides the loading modal."""
-    try:
-        page.wait_for_function(
-            """() => {
-                const rows = document.querySelectorAll('.depart-trips tr');
-                const modalVisible = document.querySelector('#popupModal.show');
-                return rows.length > 0 && !modalVisible;
-            }""",
-            timeout=timeout_ms,
-        )
-    except PlaywrightTimeoutError:
-        pass
-    page.wait_for_timeout(300)
-
-
 def submit_search(
     page: Page,
     origin: str,
@@ -203,19 +205,19 @@ def submit_search(
     pax: int = 1,
 ):
     """Fill the KTMB Shuttle search form and navigate to /ShuttleTrip (no login required to poll seats!)."""
-    print(f"[*] Navigating to {SHUTTLE_URL} for search...")
+    print(f"[*] Initializing search session on {SHUTTLE_URL}...")
     page.goto(SHUTTLE_URL, wait_until="domcontentloaded")
     page.wait_for_selector("#FromStationId", state="visible", timeout=15_000)
     page.wait_for_timeout(400)
 
     current_from = page.input_value("#FromStationId").strip().upper()
     if current_from != origin.upper():
-        print(f"[*] Swapping terminal direction to: {origin} -> {destination}")
+        print(f"[*] Setting direction: {origin} -> {destination}")
         page.evaluate("SwapFromToTerminal()")
         page.wait_for_timeout(200)
 
     print(
-        f"[*] Searching: {origin} -> {destination} | Depart: {onward_date} | Return: {return_date or 'One-Way'} | Pax: {pax}"
+        f"[*] Submitting search: {origin} -> {destination} | Date: {onward_date} | Pax: {pax}"
     )
     page.select_option("#PassengerCount", str(pax))
     page.evaluate(
@@ -237,10 +239,11 @@ def submit_search(
     wait_for_trips_loaded(page)
 
 
-def refresh_trips_in_place(page: Page, onward_date: str, return_date: str = ""):
+def switch_date_in_place(page: Page, target_date: str, return_date: str = "") -> bool:
     """
-    Fast AJAX refresh of train availability on /ShuttleTrip without full page reload.
-    Calls KTMB's internal ChangeDate() / GetTripToken flow (~300ms response).
+    Fast AJAX switch to `target_date` on `/ShuttleTrip` using KTMB's `ChangeDate()`.
+    Returns `True` if train timetable rows exist for `target_date`, or `False` if
+    we have reached the end of KTMB's released booking calendar!
     """
     page.evaluate(
         """([onwardDate, returnDate]) => {
@@ -252,10 +255,14 @@ def refresh_trips_in_place(page: Page, onward_date: str, return_date: str = ""):
                 }, 250);
             }
         }""",
-        [onward_date, return_date],
+        [target_date, return_date],
     )
-    page.wait_for_timeout(600)
+    page.wait_for_timeout(500)
     wait_for_trips_loaded(page)
+
+    # Check if trains are actually released on this date (released dates have > 3 train rows with data-hourminute)
+    train_rows = page.locator(".DepartSection tbody tr[data-hourminute]").count()
+    return train_rows > 0
 
 
 def find_matching_train_button(
@@ -263,47 +270,49 @@ def find_matching_train_button(
     section_selector: str,
     preferred_times: list[str],
     min_seats_required: int = 1,
+    date_label: str = "",
 ):
     """
     Scan `.DepartSection` or `.ReturnSection` for the first available train matching `preferred_times`.
     Works whether logged in (`.btn-seat-layout`) OR not logged in yet (`.btn-login`)!
-    Returns `(button_locator, time_str, seats_avail, is_login_btn)` or `(None, None, max_seen_seats, False)`.
+    Returns `(button_locator, time_str, seats_avail, is_login_btn)`.
     """
-    max_seen = 0
+    status_parts = []
+    found_result = (None, None, 0, False)
+
     for time_str in preferred_times:
         hm = time_str.replace(":", "").strip()
         row_selector = f"{section_selector} tbody tr[data-hourminute='{hm}']"
         row = page.locator(row_selector)
         if row.count() == 0:
+            status_parts.append(f"{time_str}:N/A")
             continue
 
         row_el = row.first
         seats_text = row_el.locator("td").nth(4).inner_text().strip()
         seats_match = re.search(r"(\d+)", seats_text)
         seats_avail = int(seats_match.group(1)) if seats_match else 0
-        max_seen = max(max_seen, seats_avail)
+        status_parts.append(f"{time_str}:{seats_avail}")
 
-        if seats_avail >= min_seats_required:
+        if seats_avail >= min_seats_required and found_result[0] is None:
             train_name = row_el.locator("td").nth(0).inner_text().strip()
             select_btn = row_el.locator(".btn-seat-layout:not(.disabled)")
             login_btn = row_el.locator(".btn-login")
             if select_btn.count() > 0:
-                print(f"[+] FOUND AVAILABLE TRAIN: {train_name} at {time_str} ({seats_avail} seats left!)")
-                return select_btn.first, time_str, seats_avail, False
+                print(f"    [+] {date_label} -> FOUND {train_name} at {time_str} ({seats_avail} seats!)")
+                found_result = (select_btn.first, time_str, seats_avail, False)
             elif login_btn.count() > 0:
-                print(f"[+] FOUND AVAILABLE TRAIN (unauthenticated): {train_name} at {time_str} ({seats_avail} seats left!)")
-                return login_btn.first, time_str, seats_avail, True
-        else:
-            print(f"    [-] {time_str}: {seats_avail} seats (need >= {min_seats_required})")
+                print(f"    [+] {date_label} -> FOUND {train_name} at {time_str} ({seats_avail} seats!)")
+                found_result = (login_btn.first, time_str, seats_avail, True)
 
-    return None, None, max_seen, False
+    summary = " | ".join(status_parts)
+    print(f"    [{date_label:<12}] {summary}")
+    return found_result
 
 
 def handle_recaptcha_if_prompted(page: Page):
     """
     Handle KTMB's `#recaptcha-modal` on `/ShuttleTrip/Reserve`.
-    Attempts to click the reCAPTCHA checkbox automatically; if a visual challenge pops up,
-    sends a Telegram alert with screenshot + NoVNC link so you can tap it on your phone.
     """
     page.wait_for_timeout(800)
     modal = page.locator("#recaptcha-modal")
@@ -318,7 +327,6 @@ def handle_recaptcha_if_prompted(page: Page):
         except Exception:
             pass
 
-        # Check if still visible (image challenge triggered)
         if modal.is_visible() and "/BookShuttle" not in page.url:
             vnc_url = os.getenv("VNC_PUBLIC_URL", "")
             notify(
@@ -341,10 +349,11 @@ def automate_passenger_and_checkout(
     payment_method: str,
     wallet_pin: str,
     passenger_matches: list[str] | None = None,
+    date_label: str = "",
+    train_time: str = "",
 ) -> bool:
     """
     Complete `/BookShuttle` passenger selection and KTM Wallet payment.
-    Returns True if checkout flow was triggered/completed.
     """
     print("[*] Waiting for Passenger Details page (/BookShuttle)...")
     page.wait_for_url("**/BookShuttle**", timeout=30_000)
@@ -353,17 +362,18 @@ def automate_passenger_and_checkout(
 
     notify(
         "KTMB Seat Locked!",
-        "Seat(s) reserved in cart for 10 minutes! Auto-filling passenger & payment details...",
+        f"Locked {date_label} ({train_time}) in cart for 10 mins! Selecting passenger {passenger_matches} & paying...",
         page=page,
     )
 
-    # 1. Select favorite passenger(s)
     try:
         if passenger_matches:
             for p_match in passenger_matches:
                 if not p_match:
                     continue
-                matched_el = page.locator(f"label:has-text('{p_match}'), option:has-text('{p_match}'), tr:has-text('{p_match}')")
+                matched_el = page.locator(
+                    f"label:has-text('{p_match}'), option:has-text('{p_match}'), tr:has-text('{p_match}')"
+                )
                 if matched_el.count() > 0:
                     matched_el.first.click()
                     page.wait_for_timeout(400)
@@ -382,7 +392,6 @@ def automate_passenger_and_checkout(
     except Exception as e:
         print(f"[*] Passenger auto-fill note: {e}")
 
-    # 2. Check Terms & Conditions checkboxes
     try:
         tnc_boxes = page.locator(
             "input[type='checkbox'][id*='Term'], input[type='checkbox'][name*='Term'], input[type='checkbox'][id*='Agree']"
@@ -394,7 +403,6 @@ def automate_passenger_and_checkout(
     except Exception:
         pass
 
-    # 3. Proceed to KTM Wallet checkout
     if payment_method.upper() == "KTM_WALLET":
         print("[*] Proceeding with automated KTM Wallet checkout...")
         try:
@@ -421,7 +429,11 @@ def automate_passenger_and_checkout(
                 if final_pay_btn.count() > 0 and final_pay_btn.first.is_visible():
                     final_pay_btn.first.click()
                     page.wait_for_timeout(3000)
-                    notify("KTMB Checkout Triggered", "KTM Wallet payment submitted! Check browser/Telegram screenshot.", page=page)
+                    notify(
+                        "KTMB Checkout Triggered",
+                        f"KTM Wallet payment submitted for {date_label} ({train_time})!",
+                        page=page,
+                    )
                     return True
         except Exception as e:
             print(f"[!] Partial auto-checkout note: {e}")
@@ -429,10 +441,9 @@ def automate_passenger_and_checkout(
     vnc_url = os.getenv("VNC_PUBLIC_URL", "")
     notify(
         "Complete Checkout",
-        f"Seat is held in cart for 10 mins. Verify/finish checkout at {vnc_url}",
+        f"Seat for {date_label} ({train_time}) is held in cart for 10 mins. Finish checkout at {vnc_url}",
         page=page,
     )
-    # Wait up to 10 minutes (cart hold duration) for checkout completion
     try:
         page.wait_for_url("**/Payment/**|**/Summary**", timeout=600_000)
         return True
@@ -440,12 +451,12 @@ def automate_passenger_and_checkout(
         return False
 
 
-def snipe_one_way_leg(
+def scan_and_snipe_all_dates(
     page: Page,
-    leg_key: str,
+    leg_prefix: str,
     origin: str,
     destination: str,
-    target_date: str,
+    candidate_dates: list[str],
     preferred_times: list[str],
     total_pax: int,
     split_pax: bool,
@@ -457,55 +468,73 @@ def snipe_one_way_leg(
     password: str = "",
 ):
     """
-    Snipes `total_pax` seats for a single direction (`WOODLANDS CIQ -> JB SENTRAL` or reverse).
-    If `split_pax=True` and `total_pax=2`:
-    - Searches with `1 Pax` so even a 1-seat cancellation is clickable!
-    - Books Passenger 1 on the first drop, then loops back to book Passenger 2 on the exact same train time!
+    Continuously scans through `candidate_dates` (all upcoming Sundays or Saturdays
+    until the website's last released date) and books up to `total_pax` tickets on each date!
     """
-    state = load_state()
-    leg_state = state.get(leg_key, {"booked_pax": 0, "locked_train_time": None})
-    booked_so_far = int(leg_state.get("booked_pax", 0))
-    locked_time = leg_state.get("locked_train_time")
+    search_pax = 1 if split_pax else total_pax
+    cycle = 1
 
-    if booked_so_far >= total_pax:
-        print(f"[+] {leg_key} ({target_date}) already has {booked_so_far}/{total_pax} tickets booked. Skipping!")
-        return
+    while True:
+        state = load_state()
+        # Filter out dates that already have total_pax booked
+        pending_dates = [
+            d for d in candidate_dates if int(state.get(f"{leg_prefix}_{d}", {}).get("booked_pax", 0)) < total_pax
+        ]
+        if not pending_dates:
+            print(f"[+] All target dates for {leg_prefix} have {total_pax}/{total_pax} tickets booked!")
+            return
 
-    while booked_so_far < total_pax:
-        remaining = total_pax - booked_so_far
-        search_pax = 1 if (split_pax and remaining >= 1) else remaining
-        times_to_check = [locked_time] if locked_time else preferred_times
-
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
         print(
-            f"\n[*] Sniping {origin} -> {destination} on {target_date} "
-            f"(Booked: {booked_so_far}/{total_pax} | Searching {search_pax} Pax | Target times: {times_to_check})"
+            f"\n==================== [Cycle #{cycle} @ {now_str}] Scanning {origin} -> {destination} ===================="
         )
-        submit_search(page, origin, destination, target_date, "", pax=search_pax)
 
-        attempt = 1
-        while True:
-            now_str = datetime.datetime.now().strftime("%H:%M:%S")
-            print(f"[{now_str}] Poll #{attempt} for {target_date} ({origin} -> {destination})...")
+        # Initialize search on the first pending date
+        submit_search(page, origin, destination, pending_dates[0], "", pax=search_pax)
 
+        for idx, target_date in enumerate(pending_dates):
+            leg_key = f"{leg_prefix}_{target_date}"
+            state = load_state()
+            leg_state = state.get(leg_key, {"booked_pax": 0, "locked_train_time": None})
+            booked_so_far = int(leg_state.get("booked_pax", 0))
+            locked_time = leg_state.get("locked_train_time")
+
+            if booked_so_far >= total_pax:
+                continue
+
+            if idx > 0:
+                is_released = switch_date_in_place(page, target_date, "")
+                if not is_released:
+                    print(f"    [{target_date:<12}] Reached end of KTMB released calendar. Wrapping back to start!")
+                    break
+
+            times_to_check = [locked_time] if locked_time else preferred_times
             btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
-                page, ".DepartSection", times_to_check, min_seats_required=search_pax
+                page,
+                ".DepartSection",
+                times_to_check,
+                min_seats_required=search_pax,
+                date_label=target_date,
             )
 
-            # Bonus: if we need 2 tickets, split_pax is on (so we searched 1 Pax),
-            # and >=2 seats suddenly dropped at once, we can book 1 now and immediately grab the 2nd!
             if btn:
                 if is_login_btn:
-                    print(f"[!] Seat found on {chosen_time} ({seats_avail} available)! Logging in via SSO now...")
+                    print(f"[!] Seat found on {target_date} {chosen_time} ({seats_avail} seats)! Logging in via SSO...")
                     btn.click()
                     page.wait_for_url("**/Account/Login**", timeout=30_000)
                     ensure_logged_in(page, email, password)
-                    # Re-locate actual .btn-seat-layout after SSO redirects back to /ShuttleTrip
+                    # Make sure we are viewing `target_date` after SSO redirect
+                    switch_date_in_place(page, target_date, "")
                     btn, chosen_time, seats_avail, _ = find_matching_train_button(
-                        page, ".DepartSection", [chosen_time], min_seats_required=search_pax
+                        page,
+                        ".DepartSection",
+                        [chosen_time],
+                        min_seats_required=search_pax,
+                        date_label=target_date,
                     )
 
                 if btn:
-                    print(f"[!] Clicking Select on {chosen_time} ({seats_avail} available)...")
+                    print(f"[!] Clicking Select on {target_date} {chosen_time} ({seats_avail} available)...")
                     btn.click()
                     handle_recaptcha_if_prompted(page)
 
@@ -514,22 +543,29 @@ def snipe_one_way_leg(
                         proceed_btn.click()
 
                     current_pax_match = [pax_names[booked_so_far]] if booked_so_far < len(pax_names) else None
-                    ok = automate_passenger_and_checkout(page, payment_method, wallet_pin, current_pax_match)
+                    ok = automate_passenger_and_checkout(
+                        page,
+                        payment_method,
+                        wallet_pin,
+                        current_pax_match,
+                        date_label=target_date,
+                        train_time=chosen_time,
+                    )
                     if ok:
                         booked_so_far += search_pax
                         leg_state["booked_pax"] = booked_so_far
                         leg_state["locked_train_time"] = chosen_time
                         state[leg_key] = leg_state
                         save_state(state)
-                        print(f"[+] Booked {booked_so_far}/{total_pax} for {leg_key} at {chosen_time}!")
+                        print(f"[+] Booked {booked_so_far}/{total_pax} for {target_date} at {chosen_time}!")
+                    # Re-initialize search session on next loop after a checkout attempt
                     break
 
-            attempt += 1
-            time.sleep(poll_interval)
-            if attempt % 20 == 0:
-                submit_search(page, origin, destination, target_date, "", pax=search_pax)
-            else:
-                refresh_trips_in_place(page, target_date, "")
+            time.sleep(0.4)
+
+        cycle += 1
+        print(f"[*] Finished full calendar sweep. Waiting {poll_interval}s before next sweep...")
+        time.sleep(poll_interval)
 
 
 def main():
@@ -538,14 +574,14 @@ def main():
     parser = argparse.ArgumentParser(description="KTMB Shuttle Tebrau Ticket Sniper & Auto-Buyer")
     parser.add_argument(
         "--mode",
-        choices=["auto_weekend", "roundtrip", "single_sat", "single_sun"],
-        default=os.getenv("BOOKING_MODE", "auto_weekend"),
-        help="Booking mode: 'auto_weekend' (snipes Sat then Sun), 'single_sat', 'single_sun', or 'roundtrip'",
+        choices=["auto_weekend", "single_sat", "single_sun"],
+        default=os.getenv("BOOKING_MODE", "single_sun"),
+        help="Booking mode: 'single_sun' (all Sundays JB->SG), 'single_sat' (all Saturdays SG->JB), or 'auto_weekend'",
     )
-    parser.add_argument("--sat-date", default=os.getenv("TARGET_SATURDAY_DATE", ""), help="Saturday date, e.g. '14 Nov 2026'")
-    parser.add_argument("--sun-date", default=os.getenv("TARGET_SUNDAY_DATE", ""), help="Sunday date, e.g. '15 Nov 2026'")
-    parser.add_argument("--weeks-ahead", type=int, default=0, help="Target weekend N weeks ahead (0 = upcoming weekend)")
-    parser.add_argument("--interval", type=float, default=float(os.getenv("POLL_INTERVAL_SECONDS", "4")), help="Polling interval in seconds")
+    parser.add_argument("--sat-date", default=os.getenv("TARGET_SATURDAY_DATE", ""), help="Optional single Saturday date override")
+    parser.add_argument("--sun-date", default=os.getenv("TARGET_SUNDAY_DATE", ""), help="Optional single Sunday date override")
+    parser.add_argument("--max-weeks", type=int, default=int(os.getenv("MAX_SCAN_WEEKS", "22")), help="Max weeks ahead to scan until end of released calendar")
+    parser.add_argument("--interval", type=float, default=float(os.getenv("POLL_INTERVAL_SECONDS", "4")), help="Pause in seconds between full calendar sweeps")
     parser.add_argument("--wait-for-drop", action="store_true", help="Wait until 08:29:55 AM SGT/MYT before starting high-speed sniping")
     args = parser.parse_args()
 
@@ -563,19 +599,18 @@ def main():
         os.getenv("PASSENGER_2_MATCH", "").strip(),
     ]
 
-    sat_date, sun_date = args.sat_date, args.sun_date
-    if not sat_date or not sun_date:
-        auto_sat, auto_sun = get_next_weekend_dates(args.weeks_ahead)
-        sat_date = sat_date or auto_sat
-        sun_date = sun_date or auto_sun
+    sat_dates = [args.sat_date] if args.sat_date else get_upcoming_weekday_dates(5, args.max_weeks)
+    sun_dates = [args.sun_date] if args.sun_date else get_upcoming_weekday_dates(6, args.max_weeks)
 
     print("=" * 72)
-    print("KTMB SHUTTLE TEBRAU SNIPER (LINUX LXC / XVFB EDITION)")
+    print("KTMB SHUTTLE TEBRAU MULTI-WEEK SNIPER (LINUX LXC / XVFB EDITION)")
     print(f"  Mode               : {args.mode}")
-    print(f"  Saturday (SG -> JB): {sat_date} | Trains: {sat_times}")
-    print(f"  Sunday   (JB -> SG): {sun_date} | Trains: {sun_times}")
-    print(f"  Total Tickets      : {total_pax} Pax (Split 1+1 Snipe: {split_pax})")
-    print(f"  Poll Interval      : {args.interval}s")
+    if args.mode in ("auto_weekend", "single_sat"):
+        print(f"  Saturday (SG -> JB): Scanning all released Saturdays ({sat_dates[0]} -> ...) | Trains: {sat_times}")
+    if args.mode in ("auto_weekend", "single_sun"):
+        print(f"  Sunday   (JB -> SG): Scanning all released Sundays ({sun_dates[0]} -> ...) | Trains: {sun_times}")
+    print(f"  Total Tickets/Date : {total_pax} Pax (Split 1+1 Snipe: {split_pax}) | Passengers: {pax_names}")
+    print(f"  Sweep Interval     : {args.interval}s")
     print("=" * 72)
 
     with sync_playwright() as p:
@@ -601,31 +636,13 @@ def main():
                     break
                 time.sleep(0.5)
 
-        if args.mode in ("auto_weekend", "single_sat"):
-            snipe_one_way_leg(
+        if args.mode == "single_sun":
+            scan_and_snipe_all_dates(
                 page=page,
-                leg_key=f"SAT_{sat_date}",
-                origin="WOODLANDS CIQ",
-                destination="JB SENTRAL",
-                target_date=sat_date,
-                preferred_times=sat_times,
-                total_pax=total_pax,
-                split_pax=split_pax,
-                poll_interval=args.interval,
-                payment_method=payment_method,
-                wallet_pin=wallet_pin,
-                pax_names=pax_names,
-                email=email,
-                password=password,
-            )
-
-        if args.mode in ("auto_weekend", "single_sun"):
-            snipe_one_way_leg(
-                page=page,
-                leg_key=f"SUN_{sun_date}",
+                leg_prefix="SUN",
                 origin="JB SENTRAL",
                 destination="WOODLANDS CIQ",
-                target_date=sun_date,
+                candidate_dates=sun_dates,
                 preferred_times=sun_times,
                 total_pax=total_pax,
                 split_pax=split_pax,
@@ -636,38 +653,58 @@ def main():
                 email=email,
                 password=password,
             )
-
-        if args.mode == "roundtrip":
-            submit_search(page, "WOODLANDS CIQ", "JB SENTRAL", sat_date, sun_date, pax=total_pax)
-            attempt = 1
+        elif args.mode == "single_sat":
+            scan_and_snipe_all_dates(
+                page=page,
+                leg_prefix="SAT",
+                origin="WOODLANDS CIQ",
+                destination="JB SENTRAL",
+                candidate_dates=sat_dates,
+                preferred_times=sat_times,
+                total_pax=total_pax,
+                split_pax=split_pax,
+                poll_interval=args.interval,
+                payment_method=payment_method,
+                wallet_pin=wallet_pin,
+                pax_names=pax_names,
+                email=email,
+                password=password,
+            )
+        else:  # auto_weekend
+            # Alternate sweeping all Saturdays and all Sundays
             while True:
-                print(f"\n[Roundtrip Poll #{attempt}] Checking {sat_date} & {sun_date} ({total_pax} Pax)...")
-                sat_btn, sat_time, _, sat_is_login = find_matching_train_button(page, ".DepartSection", sat_times, total_pax)
-                sun_btn, sun_time, _, _ = find_matching_train_button(page, ".ReturnSection", sun_times, total_pax)
-                if sat_btn and sun_btn:
-                    if sat_is_login:
-                        sat_btn.click()
-                        page.wait_for_url("**/Account/Login**", timeout=30_000)
-                        ensure_logged_in(page, email, password)
-                        sat_btn, sat_time, _, _ = find_matching_train_button(page, ".DepartSection", [sat_time], total_pax)
-                    if sat_btn:
-                        sat_btn.click()
-                        page.wait_for_timeout(300)
-                        sun_btn, _, _, _ = find_matching_train_button(page, ".ReturnSection", [sun_time], total_pax)
-                        if sun_btn:
-                            sun_btn.click()
-                            handle_recaptcha_if_prompted(page)
-                            proceed_btn = page.locator(".btn-passenger")
-                            if proceed_btn.count() > 0 and proceed_btn.is_visible():
-                                proceed_btn.click()
-                            automate_passenger_and_checkout(page, payment_method, wallet_pin, pax_names)
-                            break
-                attempt += 1
-                time.sleep(args.interval)
-                if attempt % 20 == 0:
-                    submit_search(page, "WOODLANDS CIQ", "JB SENTRAL", sat_date, sun_date, pax=total_pax)
-                else:
-                    refresh_trips_in_place(page, sat_date, sun_date)
+                scan_and_snipe_all_dates(
+                    page=page,
+                    leg_prefix="SAT",
+                    origin="WOODLANDS CIQ",
+                    destination="JB SENTRAL",
+                    candidate_dates=sat_dates[:1],
+                    preferred_times=sat_times,
+                    total_pax=total_pax,
+                    split_pax=split_pax,
+                    poll_interval=args.interval,
+                    payment_method=payment_method,
+                    wallet_pin=wallet_pin,
+                    pax_names=pax_names,
+                    email=email,
+                    password=password,
+                )
+                scan_and_snipe_all_dates(
+                    page=page,
+                    leg_prefix="SUN",
+                    origin="JB SENTRAL",
+                    destination="WOODLANDS CIQ",
+                    candidate_dates=sun_dates[:1],
+                    preferred_times=sun_times,
+                    total_pax=total_pax,
+                    split_pax=split_pax,
+                    poll_interval=args.interval,
+                    payment_method=payment_method,
+                    wallet_pin=wallet_pin,
+                    pax_names=pax_names,
+                    email=email,
+                    password=password,
+                )
 
 
 if __name__ == "__main__":
