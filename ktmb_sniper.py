@@ -517,9 +517,10 @@ def automate_passenger_and_checkout(
     except Exception as e:
         print(f"[*] 'I am travelling' checkbox note: {e}")
 
-    # 2. Fill each passenger's "Select Friends and Family" dropdown.
-    #    Dropdown N gets passenger_matches[N]; a person already picked in an earlier
-    #    dropdown is never reused (KTMB rejects "Duplicated passport number").
+    # 2. Fill the OTHER passengers from their "Select Friends and Family" dropdown.
+    #    Passenger 1 is the logged-in account holder ("I am travelling"), so the first
+    #    dropdown is left untouched. Dropdown 2, 3, ... get the configured names in order,
+    #    never reusing one (KTMB rejects "Duplicated passport number").
     try:
         names = [n for n in (passenger_matches or []) if n]
         used_labels: set[str] = set()
@@ -530,7 +531,11 @@ def automate_passenger_and_checkout(
                 opts_text = [t.strip() for t in sel.locator("option").all_inner_texts()]
                 if not any("friends" in o.lower() or "family" in o.lower() for o in opts_text):
                     continue
-                print(f"[*] Found passenger dropdown #{dropdown_no + 1} with options: {opts_text}")
+                dropdown_no += 1
+                if dropdown_no == 1:
+                    print("[*] Passenger 1 dropdown left as-is (using 'I am travelling')")
+                    continue
+                print(f"[*] Found passenger {dropdown_no} dropdown with options: {opts_text}")
 
                 def _pick(label_filter) -> int | None:
                     for idx, opt_label in enumerate(opts_text):
@@ -540,33 +545,38 @@ def automate_passenger_and_checkout(
                             return idx
                     return None
 
-                # Preferred: the name configured for this passenger slot.
                 chosen = None
-                if dropdown_no < len(names):
-                    target = names[dropdown_no].lower()
-                    chosen = _pick(lambda o: target in o.lower())
-                # Fallback: any remaining name from the configured list, then any unused option.
-                if chosen is None:
-                    for target_name in names:
-                        chosen = _pick(lambda o, t=target_name.lower(): t in o.lower())
-                        if chosen is not None:
-                            break
-                if chosen is None:
+                for target_name in names:
+                    chosen = _pick(lambda o, t=target_name.lower(): t in o.lower())
+                    if chosen is not None:
+                        break
+                # Only guess a saved passenger when no names are configured at all;
+                # a wrong person on a ticket is worse than leaving it blank.
+                if chosen is None and not names:
                     chosen = _pick(lambda o: True)
 
                 if chosen is not None:
                     sel.select_option(index=chosen)
                     sel.dispatch_event("change")
                     used_labels.add(opts_text[chosen])
-                    print(f"[+] Passenger {dropdown_no + 1}: selected '{opts_text[chosen]}'")
+                    print(f"[+] Passenger {dropdown_no}: selected '{opts_text[chosen]}'")
                 else:
-                    print(f"[!] Passenger {dropdown_no + 1}: no unused saved passenger available")
-                dropdown_no += 1
-                page.wait_for_timeout(400)
+                    print(f"[!] Passenger {dropdown_no}: no matching saved passenger for {names}")
+                page.wait_for_timeout(600)
             except Exception as ex:
                 print(f"[*] Friends & Family dropdown item error: {ex}")
     except Exception as e:
         print(f"[*] Friends and Family selection note: {e}")
+
+    # Make sure "I am travelling" is still ticked for Passenger 1.
+    try:
+        travelling_cb = page.locator("input[type='checkbox']").first
+        if travelling_cb.count() > 0 and not travelling_cb.is_checked():
+            print("[*] Re-checking 'I am travelling' for Passenger 1...")
+            travelling_cb.check(force=True)
+            page.wait_for_timeout(800)
+    except Exception as e:
+        print(f"[*] 'I am travelling' re-check note: {e}")
 
     # 3. Ensure "Ticket type *" (Adult / Dewasa) is selected for all passengers
     try:
