@@ -482,6 +482,163 @@ def reserve_and_wait_passenger_page(page: Page, timeout_sec: int = 180) -> bool:
     return False
 
 
+def _first_visible(page: Page, selectors: list[str]):
+    """Return (locator, selector) for the first visible match among `selectors`, else (None, None)."""
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 10)):
+                item = loc.nth(i)
+                if item.is_visible():
+                    return item, sel
+        except Exception:
+            continue
+    return None, None
+
+
+def _log_clickables(page: Page) -> None:
+    """Print visible buttons/links/images so a stuck payment page can be diagnosed from the log."""
+    try:
+        items = page.evaluate(
+            """() => [...document.querySelectorAll('button,a,input[type=button],input[type=submit],img,label')]
+                .filter(e => e.offsetParent !== null)
+                .map(e => e.tagName + ':' + (e.innerText || e.value || e.alt || e.getAttribute('src') || '').trim().slice(0, 60))
+                .slice(0, 60)"""
+        )
+        print(f"[*] Visible clickables on page: {items}")
+    except Exception:
+        pass
+
+
+WALLET_SELECTORS = [
+    "img[alt*='wallet' i]",
+    "img[src*='wallet' i]",
+    "[class*='wallet' i]:visible",
+    "[id*='wallet' i]:visible",
+    "text=/^\\s*KTM Wallet\\s*$/i",
+    # Fallback: the first image after the "Payment Options" heading is the KTM Wallet card.
+    "xpath=(//*[normalize-space(text())='Payment Options']/following::img)[1]",
+]
+
+PAY_BUTTON_SELECTORS = [
+    "button:text-matches('^\\\\s*(pay now|pay|bayar|confirm|submit|proceed|continue)\\\\s*$', 'i')",
+    "a:text-matches('^\\\\s*(pay now|pay|bayar|confirm|submit|proceed|continue)\\\\s*$', 'i')",
+    "input[type='submit'][value*='Pay' i], input[type='button'][value*='Pay' i]",
+    "input[type='submit'][value*='Confirm' i], input[type='button'][value*='Confirm' i]",
+    "#btnPay, #btnConfirm",
+]
+
+PIN_SELECTORS = [
+    "input[type='password']",
+    "input[id*='pin' i]",
+    "input[name*='pin' i]",
+    "input[placeholder*='pin' i]",
+]
+
+
+def _checkout_ktm_wallet(page: Page, wallet_pin: str, date_label: str, train_time: str) -> bool:
+    """On the Payment page: pick the KTM Wallet card, accept T&C, enter PIN, press Pay/Confirm."""
+    try:
+        page.wait_for_selector("text=/Payment Options/i", timeout=20_000)
+    except Exception as e:
+        print(f"[*] 'Payment Options' not seen yet: {e}")
+    page.wait_for_timeout(800)
+
+    # The wallet cards sit at the bottom of the page.
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    wallet, used = _first_visible(page, WALLET_SELECTORS)
+    if wallet is None:
+        print("[!] Could not find the KTM Wallet card on the payment page.")
+        _log_clickables(page)
+        return False
+
+    print(f"[*] Clicking KTM Wallet card (matched {used!r})...")
+    try:
+        wallet.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+    try:
+        wallet.click(timeout=5000)
+    except Exception:
+        wallet.click(force=True)
+    page.wait_for_timeout(1500)
+    notify(
+        "KTM Wallet selected",
+        f"Clicked KTM Wallet for {date_label} ({train_time}). Continuing checkout...",
+        page=page,
+    )
+
+    # Walk through whatever follows (T&C tick, PIN prompt, Pay / Confirm buttons).
+    pin_filled = False
+    pay_clicked = False
+    clicked_keys: set[tuple[str, bool]] = set()
+    for step in range(1, 7):
+        page.wait_for_timeout(800)
+
+        # T&C / consent checkboxes
+        try:
+            boxes = page.locator("input[type='checkbox']")
+            for i in range(boxes.count()):
+                cb = boxes.nth(i)
+                if cb.is_visible() and not cb.is_checked():
+                    cb.check(force=True)
+                    print("[+] Ticked a checkbox on payment page")
+        except Exception:
+            pass
+
+        # PIN prompt
+        if wallet_pin and not pin_filled:
+            pin_input, _ = _first_visible(page, PIN_SELECTORS)
+            if pin_input is not None:
+                print("[*] Entering KTM Wallet PIN...")
+                pin_input.click()
+                pin_input.fill(wallet_pin)
+                pin_filled = True
+                page.wait_for_timeout(300)
+
+        # Pay / Confirm button
+        btn, used = _first_visible(page, PAY_BUTTON_SELECTORS)
+        if btn is None:
+            if pay_clicked:
+                break
+            print(f"[*] Step {step}: no Pay/Confirm button visible yet")
+            _log_clickables(page)
+            continue
+        try:
+            label = (btn.inner_text() or btn.get_attribute("value") or "").strip().lower()
+        except Exception:
+            label = ""
+        # Never press the same button twice in the same state (avoids paying twice);
+        # a second press is only allowed after a new PIN prompt was filled or a different button shows up.
+        click_key = (label, pin_filled)
+        if click_key in clicked_keys or len(clicked_keys) >= 3:
+            print(f"[*] Step {step}: '{label}' already pressed, waiting for the result instead of pressing again")
+            break
+        clicked_keys.add(click_key)
+        print(f"[*] Step {step}: clicking '{label}' ({used!r})...")
+        try:
+            btn.click(timeout=5000)
+        except Exception:
+            btn.click(force=True)
+        pay_clicked = True
+        page.wait_for_timeout(2500)
+
+    if pay_clicked:
+        page.wait_for_timeout(2000)
+        notify(
+            "🎉 KTMB Payment Submitted",
+            f"KTM Wallet payment submitted for {date_label} ({train_time}). Check the screenshot / your email to confirm.",
+            page=page,
+        )
+        return True
+    return False
+
+
 def automate_passenger_and_checkout(
     page: Page,
     payment_method: str,
@@ -630,55 +787,15 @@ def automate_passenger_and_checkout(
     except Exception as e:
         print(f"[!] Error clicking PROCEED TO PAYMENT: {e}")
 
-    # Wait for navigation to payment page
-    try:
-        page.wait_for_url("**/Payment**|**/Checkout**|**/Cart**|**/Summary**", timeout=20_000)
-        print(f"[+] Navigated to payment page: {page.url}")
-    except Exception as e:
-        print(f"[*] Navigation to payment page note: {e}")
-
     page.wait_for_load_state("domcontentloaded")
     page.wait_for_timeout(1500)
 
-    # 6. Proceed to KTM Wallet checkout on payment page
+    # 6. KTM Wallet checkout on the payment page
     if payment_method.upper() == "KTM_WALLET":
         print("[*] Proceeding with automated KTM Wallet checkout...")
         try:
-            wallet_opt = page.locator(
-                "text=/KTM Wallet/i, input[value*='Wallet'], label:has-text('KTM Wallet'), label:has-text('Wallet'), .payment-method:has-text('Wallet'), div:has-text('KTM Wallet')"
-            ).first
-            if wallet_opt.count() > 0 and wallet_opt.is_visible():
-                print("[*] Selecting KTM Wallet...")
-                wallet_opt.click()
-                page.wait_for_timeout(800)
-
-                # Check payment T&C if any
-                ptnc = page.locator("input[type='checkbox']")
-                for i in range(ptnc.count()):
-                    cb = ptnc.nth(i)
-                    if cb.is_visible() and not cb.is_checked():
-                        cb.check(force=True)
-
-                if wallet_pin:
-                    pin_input = page.locator("input[type='password'], input[id*='Pin' i], input[name*='Pin' i]").first
-                    if pin_input.count() > 0 and pin_input.is_visible():
-                        print("[*] Entering KTM Wallet PIN...")
-                        pin_input.fill(wallet_pin)
-                        page.wait_for_timeout(300)
-
-                final_pay_btn = page.locator(
-                    "button:has-text('Pay'), button:has-text('Bayar'), button:has-text('Confirm'), a:has-text('Pay'), input[value*='Pay'], #btnPay"
-                ).first
-                if final_pay_btn.count() > 0 and final_pay_btn.is_visible():
-                    print("[*] Submitting final payment...")
-                    final_pay_btn.click()
-                    page.wait_for_timeout(4000)
-                    notify(
-                        "🎉 KTMB Payment Completed!",
-                        f"KTM Wallet payment successfully processed for {date_label} ({train_time})!",
-                        page=page,
-                    )
-                    return True
+            if _checkout_ktm_wallet(page, wallet_pin, date_label, train_time):
+                return True
         except Exception as e:
             print(f"[!] Partial auto-checkout note: {e}")
 
