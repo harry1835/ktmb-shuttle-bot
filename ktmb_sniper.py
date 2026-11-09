@@ -168,29 +168,95 @@ def wait_for_trips_loaded(page: Page, timeout_ms: int = 15_000):
     page.wait_for_timeout(250)
 
 
+SESSION_COOKIES_FILE = USER_DATA_DIR / "session_cookies.json"
+SESSION_COOKIE_TTL_SEC = 6 * 3600          # how long a restored "session" cookie is kept alive locally
+MULTI_LOGIN_RETRY_SEC = 60                 # wait between retries when KITS says "Not allow multiple login"
+MULTI_LOGIN_MAX_WAIT_SEC = 30 * 60         # give up after this long
+
+
+def save_session_cookies(context) -> None:
+    """Persist KTMB cookies. Chromium drops session cookies when the browser closes, which makes
+    a restart look like a second login to KITS ("Not allow multiple login")."""
+    try:
+        cookies = [c for c in context.cookies() if "ktmb" in c.get("domain", "").lower()]
+        if cookies:
+            SESSION_COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SESSION_COOKIES_FILE.write_text(json.dumps(cookies))
+    except Exception as e:
+        print(f"[*] Could not save session cookies: {e}")
+
+
+def restore_session_cookies(context) -> None:
+    """Re-add saved KTMB cookies (session cookies get a local expiry) so a restart reuses the live KITS session."""
+    try:
+        if not SESSION_COOKIES_FILE.exists():
+            return
+        now = time.time()
+        restored = []
+        for c in json.loads(SESSION_COOKIES_FILE.read_text()):
+            exp = c.get("expires", -1)
+            if exp is None or exp < 0:
+                c["expires"] = now + SESSION_COOKIE_TTL_SEC
+            elif exp < now:
+                continue
+            restored.append(c)
+        if restored:
+            context.add_cookies(restored)
+            print(f"[+] Restored {len(restored)} saved KTMB session cookies")
+    except Exception as e:
+        print(f"[*] Could not restore session cookies: {e}")
+
+
 def ensure_logged_in(page: Page, email: str, password: str):
     """
     Handle KTMB's cross-domain SSO (`online.ktmb.com.my/Account/Login?q=...`)
     when redirected from `.btn-login` on `/ShuttleTrip`.
     """
     if "/Account/Login" not in page.url:
+        save_session_cookies(page.context)
         return
 
     print(f"[*] On KTMB SSO Login page ({page.url[:60]}...)...")
     if email and password and email != "your_email@example.com":
-        print(f"[*] Submitting KITS login for {email}...")
-        page.fill("#Email", email)
-        page.fill("#Password", password)
-        page.click("#LoginButton")
-        page.wait_for_load_state("domcontentloaded")
-        page.wait_for_timeout(1500)
+        deadline = time.time() + MULTI_LOGIN_MAX_WAIT_SEC
+        alerted = False
+        while True:
+            print(f"[*] Submitting KITS login for {email}...")
+            page.fill("#Email", email)
+            page.fill("#Password", password)
+            page.click("#LoginButton")
+            page.wait_for_load_state("domcontentloaded")
+            page.wait_for_timeout(1500)
 
-        err_modal = page.locator("#validationSummaryModalBody")
-        if err_modal.count() > 0 and err_modal.is_visible():
-            err_text = err_modal.inner_text().strip()
-            if err_text:
-                notify("KTMB Login Error", f"KITS rejected login: {err_text}", page=page)
-                sys.exit(1)
+            err_text = ""
+            err_modal = page.locator("#validationSummaryModalBody")
+            if err_modal.count() > 0 and err_modal.is_visible():
+                err_text = err_modal.inner_text().strip()
+            if not err_text:
+                break
+
+            if "multiple login" in err_text.lower() and time.time() < deadline:
+                # The account still has a live KITS session (another device/browser, or the
+                # session from before a restart). It frees up when that session ends/expires.
+                if not alerted:
+                    alerted = True
+                    notify(
+                        "KTMB Login Blocked",
+                        f"KITS says: {err_text}\n"
+                        f"Your account is already logged in somewhere else. Log out on your phone/other browser, "
+                        f"or just wait - I'll retry every {MULTI_LOGIN_RETRY_SEC}s for up to "
+                        f"{MULTI_LOGIN_MAX_WAIT_SEC // 60} min.",
+                        page=page,
+                    )
+                else:
+                    print(f"[*] Still blocked by KITS ({err_text[:40]}...), retrying in {MULTI_LOGIN_RETRY_SEC}s")
+                page.wait_for_timeout(MULTI_LOGIN_RETRY_SEC * 1000)
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_selector("#Email", state="visible", timeout=15_000)
+                continue
+
+            notify("KTMB Login Error", f"KITS rejected login: {err_text}", page=page)
+            sys.exit(1)
     else:
         vnc_url = os.getenv("VNC_PUBLIC_URL", "")
         notify(
@@ -203,6 +269,7 @@ def ensure_logged_in(page: Page, email: str, password: str):
         page.wait_for_url("**/ShuttleTrip**", timeout=120_000)
         wait_for_trips_loaded(page)
         print("[+] SSO Login successful! Returned to /ShuttleTrip with active session!")
+        save_session_cookies(page.context)
     except PlaywrightTimeoutError:
         notify("KTMB Login Failed", f"Login timed out at URL: {page.url}. Check credentials in .env.", page=page)
         sys.exit(1)
@@ -1220,6 +1287,7 @@ def main():
                 "--disable-dev-shm-usage",
             ],
         )
+        restore_session_cookies(context)
         page = context.pages[0] if context.pages else context.new_page()
 
         if args.wait_for_drop:
