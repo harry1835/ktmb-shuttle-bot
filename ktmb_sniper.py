@@ -48,6 +48,84 @@ USER_DATA_DIR = ROOT_DIR / "browser_profile"
 STATE_FILE = ROOT_DIR / "bookings_state.json"
 SCREENSHOT_DIR = ROOT_DIR / "screenshots"
 
+# Memory hygiene: Chromium + the Playwright driver grow steadily when one page is polled
+# for days, so the process exits at a safe point every RECYCLE_MINUTES and systemd
+# (Restart=always) starts a fresh one. The persistent browser profile keeps the session.
+_PROCESS_START = time.monotonic()
+# Held by /buy and /scrap jobs: allows one extra Chromium at a time and blocks a recycle mid-job.
+_SIDE_JOB_LOCK = threading.Lock()
+
+
+class RecycleRequested(Exception):
+    """Raised between sweeps when the process should exit so systemd restarts it fresh."""
+
+
+def _parse_window(spec: str) -> tuple[int, int] | None:
+    """Parse 'HH:MM-HH:MM' into (start_minute, end_minute) of the day; None if blank/invalid."""
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", spec or "")
+    if not m:
+        return None
+    h1, m1, h2, m2 = (int(g) for g in m.groups())
+    return (h1 % 24) * 60 + m1, (h2 % 24) * 60 + m2
+
+
+def _in_window(window: tuple[int, int] | None, now: datetime.datetime, lead_minutes: int = 0) -> bool:
+    """True if `now` falls inside the window (windows may wrap past midnight)."""
+    if not window:
+        return False
+    start, end = window
+    start = (start - lead_minutes) % 1440
+    minute = now.hour * 60 + now.minute
+    return start <= minute < end if start <= end else (minute >= start or minute < end)
+
+
+def _peak_window() -> tuple[int, int] | None:
+    return _parse_window(os.getenv("PEAK_WINDOW", "08:25-08:45"))
+
+
+def current_poll_interval(base_interval: float, now: datetime.datetime | None = None) -> float:
+    """
+    Pause between sweeps for the current time of day:
+      - PEAK_WINDOW  (daily ticket release): PEAK_POLL_INTERVAL_SECONDS
+      - NIGHT_WINDOW (few cancellations)   : NIGHT_POLL_INTERVAL_SECONDS
+      - otherwise                          : `base_interval` (POLL_INTERVAL_SECONDS / --interval)
+    """
+    now = now or datetime.datetime.now()
+    if _in_window(_peak_window(), now):
+        return float(os.getenv("PEAK_POLL_INTERVAL_SECONDS", "2"))
+    if _in_window(_parse_window(os.getenv("NIGHT_WINDOW", "00:00-07:00")), now):
+        return float(os.getenv("NIGHT_POLL_INTERVAL_SECONDS", "60"))
+    return base_interval
+
+
+def maybe_recycle(page: Page):
+    """Between sweeps: if the process is older than RECYCLE_MINUTES, close the browser and exit."""
+    recycle_minutes = float(os.getenv("RECYCLE_MINUTES", "60"))
+    if recycle_minutes <= 0 or time.monotonic() - _PROCESS_START < recycle_minutes * 60:
+        return
+    # Never restart just before or during the release window.
+    if _in_window(_peak_window(), datetime.datetime.now(), lead_minutes=5):
+        return
+    # A /buy or /scrap job is running: try again after the next sweep. On success the lock
+    # stays held until the process exits, so no new job can start a browser meanwhile.
+    if not _SIDE_JOB_LOCK.acquire(blocking=False):
+        return
+    print(f"[*] Process is older than {recycle_minutes:g} min. Exiting so systemd restarts it with fresh memory...")
+    try:
+        page.context.close()
+    except Exception:
+        pass
+    raise RecycleRequested()
+
+
+def run_side_job(fn, *args):
+    """Run a Telegram-triggered browser job (/buy, /scrap) one at a time."""
+    with _SIDE_JOB_LOCK:
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f"[!] {fn.__name__} failed: {e}")
+
 
 def send_telegram(message: str, photo_path: Path | None = None):
     """Send a Telegram alert (and optional screenshot) if TELEGRAM_BOT_TOKEN is configured."""
@@ -939,8 +1017,10 @@ def scan_and_snipe_all_dates(
             time.sleep(0.4)
 
         cycle += 1
-        print(f"[*] Finished full calendar sweep. Waiting {poll_interval}s before next sweep...")
-        time.sleep(poll_interval)
+        maybe_recycle(page)
+        pause = current_poll_interval(poll_interval)
+        print(f"[*] Finished full calendar sweep. Waiting {pause:g}s before next sweep...")
+        time.sleep(pause)
         if single_sweep:
             return
 
@@ -1114,16 +1194,16 @@ def start_telegram_command_listener():
                 if cmd_clean.startswith("/buy"):
                     print(f"[*] Received Telegram /buy command: '{text}' from chat {chat_id}")
                     threading.Thread(
-                        target=execute_direct_buy,
-                        args=(text, chat_id),
+                        target=run_side_job,
+                        args=(execute_direct_buy, text, chat_id),
                         daemon=True,
                     ).start()
                 elif cmd_clean.startswith("/scrap"):
                     print(f"[*] Received Telegram command: '{text}' from chat {chat_id}")
                     send_telegram(f"⏳ Generating available seats PDF report for `{text}`... Please wait ~10-15s.")
                     threading.Thread(
-                        target=handle_scrape_command,
-                        args=(text, chat_id),
+                        target=run_side_job,
+                        args=(handle_scrape_command, text, chat_id),
                         daemon=True,
                     ).start()
                 elif cmd_clean == "/status":
@@ -1176,7 +1256,7 @@ def main():
     parser.add_argument("--sat-date", default=os.getenv("TARGET_SATURDAY_DATE", ""), help="Optional single Saturday date override")
     parser.add_argument("--sun-date", default=os.getenv("TARGET_SUNDAY_DATE", ""), help="Optional single Sunday date override")
     parser.add_argument("--max-weeks", type=int, default=int(os.getenv("MAX_SCAN_WEEKS", "36")), help="Max weeks ahead to scan until end of released calendar")
-    parser.add_argument("--interval", type=float, default=float(os.getenv("POLL_INTERVAL_SECONDS", "4")), help="Pause in seconds between full calendar sweeps")
+    parser.add_argument("--interval", type=float, default=float(os.getenv("POLL_INTERVAL_SECONDS", "15")), help="Daytime pause in seconds between full calendar sweeps (peak/night windows override it)")
     parser.add_argument("--wait-for-drop", action="store_true", help="Wait until 08:29:55 AM SGT/MYT before starting high-speed sniping")
     args = parser.parse_args()
 
@@ -1205,7 +1285,12 @@ def main():
     if args.mode in ("auto_weekend", "single_sun"):
         print(f"  Sunday   (JB -> SG): Scanning all released Sundays ({sun_dates[0]} -> ...) | Trains: {sun_times}")
     print(f"  Total Tickets/Date : {total_pax} Pax (Split 1+1 Snipe: {split_pax}) | Passengers: {pax_names}")
-    print(f"  Sweep Interval     : {args.interval}s")
+    print(
+        f"  Sweep Interval     : {args.interval:g}s daytime | "
+        f"{os.getenv('PEAK_POLL_INTERVAL_SECONDS', '2')}s in {os.getenv('PEAK_WINDOW', '08:25-08:45')} | "
+        f"{os.getenv('NIGHT_POLL_INTERVAL_SECONDS', '60')}s in {os.getenv('NIGHT_WINDOW', '00:00-07:00')}"
+    )
+    print(f"  Recycle            : every {os.getenv('RECYCLE_MINUTES', '60')} min (0 = off)")
     print("=" * 72)
 
     with sync_playwright() as p:
@@ -1315,4 +1400,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RecycleRequested:
+        sys.exit(0)
