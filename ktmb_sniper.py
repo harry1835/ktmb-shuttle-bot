@@ -101,6 +101,9 @@ def current_poll_interval(base_interval: float, now: datetime.datetime | None = 
 def maybe_recycle(page: Page):
     """Between sweeps: if the process is older than RECYCLE_MINUTES, close the browser and exit."""
     recycle_minutes = float(os.getenv("RECYCLE_MINUTES", "60"))
+    # Only under systemd (which sets INVOCATION_ID): a manual run has nothing to restart it.
+    if not os.getenv("INVOCATION_ID"):
+        return
     if recycle_minutes <= 0 or time.monotonic() - _PROCESS_START < recycle_minutes * 60:
         return
     # Never restart just before or during the release window.
@@ -1290,7 +1293,10 @@ def main():
         f"{os.getenv('PEAK_POLL_INTERVAL_SECONDS', '2')}s in {os.getenv('PEAK_WINDOW', '08:25-08:45')} | "
         f"{os.getenv('NIGHT_POLL_INTERVAL_SECONDS', '60')}s in {os.getenv('NIGHT_WINDOW', '00:00-07:00')}"
     )
-    print(f"  Recycle            : every {os.getenv('RECYCLE_MINUTES', '60')} min (0 = off)")
+    if os.getenv("INVOCATION_ID"):
+        print(f"  Recycle            : every {os.getenv('RECYCLE_MINUTES', '60')} min (0 = off)")
+    else:
+        print("  Recycle            : off (not running under systemd)")
     print("=" * 72)
 
     with sync_playwright() as p:
