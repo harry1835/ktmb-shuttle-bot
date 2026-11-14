@@ -121,6 +121,23 @@ You can also run [`ktmb_sniper.py`](ktmb_sniper.py) directly for specific dates 
 
 ---
 
+## Memory & Polling Settings
+
+Chromium grows when one page is polled for days, so the service keeps itself small:
+
+- **Hourly recycle** — every `RECYCLE_MINUTES` (default 60) the bot exits between sweeps and systemd
+  restarts it within seconds. It never does this around `PEAK_WINDOW`, during a `/buy` or `/scrap`
+  job, or when run manually outside systemd.
+- **Memory cap** — `ktmb-sniper.service` sets `MemoryHigh` / `MemoryMax`, so a leak restarts the bot
+  instead of filling swap. Raise them if a normal checkout gets killed.
+- **Polling by time of day** — the pause between sweeps is `PEAK_POLL_INTERVAL_SECONDS` (2s) in
+  `PEAK_WINDOW` (08:25-08:45), `NIGHT_POLL_INTERVAL_SECONDS` (60s) in `NIGHT_WINDOW` (00:00-07:00),
+  and `POLL_INTERVAL_SECONDS` (15s) otherwise. Times are the container's local time.
+
+After changing the unit file: `cp systemd/ktmb-sniper.service /etc/systemd/system/ && systemctl daemon-reload && systemctl restart ktmb-sniper`.
+
+---
+
 ## Repository Structure
 
 - `ktmb_sniper.py` — Main Playwright sniper, split-pax state machine, and KTM Wallet auto-checkout script.
