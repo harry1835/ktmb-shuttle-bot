@@ -130,40 +130,176 @@ def run_side_job(fn, *args):
             print(f"[!] {fn.__name__} failed: {e}")
 
 
-def send_telegram(message: str, photo_path: Path | None = None):
-    """Send a Telegram alert (and optional screenshot) if TELEGRAM_BOT_TOKEN is configured."""
+# Pending confirmation prompts keyed by request_id -> {"event": threading.Event, "approved": bool | None}
+_PENDING_CONFIRMATIONS: dict[str, dict] = {}
+_PENDING_CONFIRMATIONS_LOCK = threading.Lock()
+
+
+def send_telegram(
+    message: str,
+    photo_path: Path | None = None,
+    reply_markup: dict | None = None,
+) -> int | None:
+    """Send a Telegram alert (and optional screenshot / inline keyboard) if TELEGRAM_BOT_TOKEN is configured."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
-        return
+        return None
 
     try:
         if photo_path and photo_path.exists():
-            subprocess.run(
-                [
-                    "curl",
-                    "-s",
-                    "-X",
-                    "POST",
-                    f"https://api.telegram.org/bot{token}/sendPhoto",
-                    "-F",
-                    f"chat_id={chat_id}",
-                    "-F",
-                    f"photo=@{photo_path}",
-                    "-F",
-                    f"caption={message}",
-                ],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            cmd = [
+                "curl",
+                "-s",
+                "-X",
+                "POST",
+                f"https://api.telegram.org/bot{token}/sendPhoto",
+                "-F",
+                f"chat_id={chat_id}",
+                "-F",
+                f"photo=@{photo_path}",
+                "-F",
+                f"caption={message}",
+            ]
+            if reply_markup is not None:
+                cmd.extend(["-F", f"reply_markup={json.dumps(reply_markup)}"])
+            res = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            try:
+                return json.loads(res.stdout).get("result", {}).get("message_id")
+            except Exception:
+                return None
         else:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            data = urllib.parse.urlencode({"chat_id": chat_id, "text": message}).encode("utf-8")
+            payload: dict[str, str] = {"chat_id": chat_id, "text": message}
+            if reply_markup is not None:
+                payload["reply_markup"] = json.dumps(reply_markup)
+            data = urllib.parse.urlencode(payload).encode("utf-8")
             req = urllib.request.Request(url, data=data)
-            urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=10)
+            res_json = json.loads(resp.read().decode("utf-8"))
+            return res_json.get("result", {}).get("message_id")
     except Exception as e:
         print(f"[!] Telegram notification error: {e}")
+        return None
+
+
+def answer_callback_query(callback_query_id: str, text: str = ""):
+    """Acknowledge a Telegram inline button tap so the client stops showing a spinner."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token or not callback_query_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
+        payload = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+    except Exception as e:
+        print(f"[!] Telegram answerCallbackQuery error: {e}")
+
+
+def edit_telegram_message(chat_id: str, message_id: int, text: str):
+    """Edit an existing Telegram message (and clear its inline keyboard)."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token or not chat_id or not message_id:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/editMessageText"
+        payload = {
+            "chat_id": chat_id,
+            "message_id": str(message_id),
+            "text": text,
+            "reply_markup": json.dumps({"inline_keyboard": []}),
+        }
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+    except Exception as e:
+        print(f"[!] Telegram editMessageText error: {e}")
+
+
+def hours_until_train(
+    target_date: str,
+    train_time: str,
+    now: datetime.datetime | None = None,
+) -> float | None:
+    """Return hours from `now` until `target_date` + `train_time` (e.g. '15 Nov 2026', '20:15')."""
+    try:
+        train_dt = datetime.datetime.strptime(f"{target_date.strip()} {train_time.strip()}", "%d %b %Y %H:%M")
+    except ValueError:
+        return None
+    now = now or datetime.datetime.now()
+    return (train_dt - now).total_seconds() / 3600.0
+
+
+def ask_user_confirm_buy(
+    target_date: str,
+    train_time: str,
+    origin: str,
+    destination: str,
+    seats_avail: int,
+    hours_left: float,
+    timeout_sec: int = 300,
+) -> bool:
+    """
+    Send a Telegram prompt with Buy / Skip inline buttons when a train is within
+    CONFIRM_WITHIN_HOURS of departure. Returns True only if the user taps Buy.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        print("[!] Train is within confirmation window, but Telegram is not configured. Skipping auto-buy.")
+        return False
+
+    req_id = f"{int(time.time() * 1000)}"
+    evt = threading.Event()
+    entry = {"event": evt, "approved": None}
+    with _PENDING_CONFIRMATIONS_LOCK:
+        _PENDING_CONFIRMATIONS[req_id] = entry
+
+    time_desc = (
+        f"{hours_left:.1f}h" if hours_left >= 1 else f"{max(0, int(hours_left * 60))}m"
+    )
+    prompt_text = (
+        f"⚠️ [Confirm Purchase - Within {time_desc}]\n"
+        f"Seat found for {target_date} ({train_time})\n"
+        f"Route: {origin} ➔ {destination}\n"
+        f"Available seats: {seats_avail}\n\n"
+        f"Departure is in {time_desc}. Do you want to buy this ticket?"
+    )
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Buy Now", "callback_data": f"confirm_buy:{req_id}:yes"},
+                {"text": "❌ Skip", "callback_data": f"confirm_buy:{req_id}:no"},
+            ]
+        ]
+    }
+
+    msg_id = send_telegram(prompt_text, reply_markup=reply_markup)
+    print(f"[*] Sent 36h confirmation prompt to Telegram (req={req_id}, timeout={timeout_sec}s)...")
+
+    responded = evt.wait(timeout=timeout_sec)
+    with _PENDING_CONFIRMATIONS_LOCK:
+        result = _PENDING_CONFIRMATIONS.pop(req_id, entry)
+
+    if not responded or result["approved"] is None:
+        print(f"[*] Confirmation timed out after {timeout_sec}s for {target_date} {train_time}. Skipping.")
+        if msg_id:
+            try:
+                dt = datetime.datetime.strptime(target_date.strip(), "%d %b %Y")
+                ymd = dt.strftime("%Y%m%d")
+                buy_hint = f"Use /buy {ymd} {train_time} if you still want it."
+            except ValueError:
+                buy_hint = ""
+            edit_telegram_message(
+                chat_id,
+                msg_id,
+                f"{prompt_text}\n\n⏱️ Timed out after {timeout_sec // 60}m — skipped. {buy_hint}".strip(),
+            )
+        return False
+
+    return bool(result["approved"])
 
 
 def notify(title: str, message: str, page: Page | None = None, sound: bool = True):
@@ -953,13 +1089,19 @@ def scan_and_snipe_all_dates(
             if booked_so_far >= total_pax:
                 continue
 
+            skipped_times = set(leg_state.get("skipped_times", []))
+            times_to_check = [
+                t for t in ([locked_time] if locked_time else preferred_times) if t not in skipped_times
+            ]
+            if not times_to_check:
+                continue
+
             if idx > 0:
                 is_released = switch_date_in_place(page, target_date, "")
                 if not is_released:
                     print(f"    [{target_date:<12}] Reached end of KTMB released calendar. Wrapping back to start!")
                     break
 
-            times_to_check = [locked_time] if locked_time else preferred_times
             btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
                 page,
                 ".DepartSection",
@@ -969,6 +1111,44 @@ def scan_and_snipe_all_dates(
             )
 
             if btn:
+                confirm_hours = float(os.getenv("CONFIRM_WITHIN_HOURS", "36"))
+                hours_left = hours_until_train(target_date, chosen_time)
+                if confirm_hours > 0 and hours_left is not None and hours_left <= confirm_hours:
+                    confirm_timeout = int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "300"))
+                    approved = ask_user_confirm_buy(
+                        target_date=target_date,
+                        train_time=chosen_time,
+                        origin=origin,
+                        destination=destination,
+                        seats_avail=seats_avail,
+                        hours_left=hours_left,
+                        timeout_sec=confirm_timeout,
+                    )
+                    if not approved:
+                        skipped = list(leg_state.get("skipped_times", []))
+                        if chosen_time not in skipped:
+                            skipped.append(chosen_time)
+                        leg_state["skipped_times"] = skipped
+                        state[leg_key] = leg_state
+                        save_state(state)
+                        print(f"[*] Skipped {target_date} {chosen_time} (within {confirm_hours:g}h).")
+                        continue
+
+                    # Re-verify seat availability after waiting for user confirmation
+                    switch_date_in_place(page, target_date, "")
+                    btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
+                        page,
+                        ".DepartSection",
+                        [chosen_time],
+                        min_seats_required=search_pax,
+                        date_label=target_date,
+                    )
+                    if not btn:
+                        send_telegram(
+                            f"⚠️ Seat for {target_date} ({chosen_time}) is no longer available (taken while waiting for confirmation)."
+                        )
+                        continue
+
                 if is_login_btn:
                     print(f"[!] Seat found on {target_date} {chosen_time} ({seats_avail} seats)! Logging in via SSO...")
                     btn.click()
@@ -1185,6 +1365,36 @@ def start_telegram_command_listener():
 
             for update in data.get("result", []):
                 last_update_id = update["update_id"]
+                cb = update.get("callback_query")
+                if cb:
+                    cb_id = cb.get("id", "")
+                    cb_data = cb.get("data", "")
+                    cb_msg = cb.get("message") or {}
+                    cb_chat_id = str(cb_msg.get("chat", {}).get("id", ""))
+                    cb_msg_id = cb_msg.get("message_id")
+                    cb_orig_text = cb_msg.get("text", "")
+
+                    if cb_data.startswith("confirm_buy:"):
+                        parts = cb_data.split(":")
+                        if len(parts) == 3:
+                            _, req_id, choice = parts
+                            approved = choice == "yes"
+                            with _PENDING_CONFIRMATIONS_LOCK:
+                                entry = _PENDING_CONFIRMATIONS.get(req_id)
+                            if entry is not None:
+                                entry["approved"] = approved
+                                entry["event"].set()
+                                ack_text = "✅ Confirmed! Booking now..." if approved else "❌ Skipped."
+                                answer_callback_query(cb_id, ack_text)
+                                status_line = "✅ Confirmed by user — booking now!" if approved else "❌ Skipped by user."
+                                if cb_chat_id and cb_msg_id:
+                                    edit_telegram_message(cb_chat_id, cb_msg_id, f"{cb_orig_text}\n\n{status_line}")
+                            else:
+                                answer_callback_query(cb_id, "This confirmation prompt has expired.")
+                                if cb_chat_id and cb_msg_id:
+                                    edit_telegram_message(cb_chat_id, cb_msg_id, f"{cb_orig_text}\n\n⏱️ Expired.")
+                    continue
+
                 msg = update.get("message") or update.get("channel_post")
                 if not msg:
                     continue
@@ -1213,7 +1423,11 @@ def start_telegram_command_listener():
                     state = load_state()
                     summary_lines = []
                     for k, v in state.items():
-                        summary_lines.append(f"• *{k}*: {v.get('booked_pax', 0)} pax booked at {v.get('locked_train_time')}")
+                        skipped = v.get("skipped_times")
+                        skip_note = f" (skipped: {', '.join(skipped)})" if skipped else ""
+                        summary_lines.append(
+                            f"• *{k}*: {v.get('booked_pax', 0)} pax booked at {v.get('locked_train_time')}{skip_note}"
+                        )
                     state_msg = "\n".join(summary_lines) if summary_lines else "No bookings recorded yet."
                     send_telegram(f"📋 *Current Bot Booking State:*\n\n{state_msg}")
                 elif cmd_clean in ("/help", "/start"):
