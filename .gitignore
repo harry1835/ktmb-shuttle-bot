@@ -4,6 +4,8 @@ __pycache__/
 .env
 browser_profile/
 bookings_state.json
+custom_snipes.json
+reports/
 screenshots/
 *.log
 .DS_Store

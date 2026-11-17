@@ -31,13 +31,14 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
-from pdf_scraper import handle_scrape_command
+from pdf_scraper import handle_scrape_command, parse_scrape_command
 
 BASE_URL = "https://shuttleonline.ktmb.com.my"
 SHUTTLE_URL = f"{BASE_URL}/Home/Shuttle"
@@ -46,6 +47,7 @@ LOGIN_URL = f"{BASE_URL}/Account/Login"
 ROOT_DIR = Path(__file__).parent.resolve()
 USER_DATA_DIR = ROOT_DIR / "browser_profile"
 STATE_FILE = ROOT_DIR / "bookings_state.json"
+CUSTOM_SNIPES_FILE = ROOT_DIR / "custom_snipes.json"
 SCREENSHOT_DIR = ROOT_DIR / "screenshots"
 
 # Memory hygiene: Chromium + the Playwright driver grow steadily when one page is polled
@@ -54,6 +56,8 @@ SCREENSHOT_DIR = ROOT_DIR / "screenshots"
 _PROCESS_START = time.monotonic()
 # Held by /buy and /scrap jobs: allows one extra Chromium at a time and blocks a recycle mid-job.
 _SIDE_JOB_LOCK = threading.Lock()
+_STATE_LOCK = threading.Lock()
+_CUSTOM_SNIPES_LOCK = threading.Lock()
 
 
 class RecycleRequested(Exception):
@@ -123,11 +127,21 @@ def maybe_recycle(page: Page):
 
 def run_side_job(fn, *args):
     """Run a Telegram-triggered browser job (/buy, /scrap) one at a time."""
+    target_chat = args[1] if len(args) > 1 and isinstance(args[1], str) else None
     with _SIDE_JOB_LOCK:
         try:
-            fn(*args)
+            res = fn(*args)
+            if fn is handle_scrape_command and res is False:
+                send_telegram(
+                    "❌ Unrecognized /scrap command format.\n"
+                    "Try /help to pick a report from the menu, or send e.g.:\n"
+                    "• /scrap-friday-woodlands-tebrau\n"
+                    "• /scrap-day/20261120-woodlands-tebrau",
+                    chat_id=target_chat,
+                )
         except Exception as e:
             print(f"[!] {fn.__name__} failed: {e}")
+            send_telegram(f"❌ {fn.__name__} failed: {e}", chat_id=target_chat)
 
 
 # Pending confirmation prompts keyed by request_id -> {"event": threading.Event, "approved": bool | None}
@@ -139,38 +153,46 @@ def send_telegram(
     message: str,
     photo_path: Path | None = None,
     reply_markup: dict | None = None,
+    chat_id: str | None = None,
+    parse_mode: str | None = None,
 ) -> int | None:
     """Send a Telegram alert (and optional screenshot / inline keyboard) if TELEGRAM_BOT_TOKEN is configured."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
+    target_chat = (chat_id or os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+    if not token or not target_chat:
         return None
 
     try:
         if photo_path and photo_path.exists():
             cmd = [
                 "curl",
-                "-s",
+                "-sS",
+                "--max-time",
+                "30",
                 "-X",
                 "POST",
                 f"https://api.telegram.org/bot{token}/sendPhoto",
                 "-F",
-                f"chat_id={chat_id}",
+                f"chat_id={target_chat}",
                 "-F",
                 f"photo=@{photo_path}",
                 "-F",
                 f"caption={message}",
             ]
+            if parse_mode:
+                cmd.extend(["-F", f"parse_mode={parse_mode}"])
             if reply_markup is not None:
                 cmd.extend(["-F", f"reply_markup={json.dumps(reply_markup)}"])
-            res = subprocess.run(cmd, check=False, capture_output=True, text=True)
+            res = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=35)
             try:
                 return json.loads(res.stdout).get("result", {}).get("message_id")
             except Exception:
                 return None
         else:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            payload: dict[str, str] = {"chat_id": chat_id, "text": message}
+            payload: dict[str, str] = {"chat_id": target_chat, "text": message}
+            if parse_mode:
+                payload["parse_mode"] = parse_mode
             if reply_markup is not None:
                 payload["reply_markup"] = json.dumps(reply_markup)
             data = urllib.parse.urlencode(payload).encode("utf-8")
@@ -178,6 +200,14 @@ def send_telegram(
             resp = urllib.request.urlopen(req, timeout=10)
             res_json = json.loads(resp.read().decode("utf-8"))
             return res_json.get("result", {}).get("message_id")
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        print(f"[!] Telegram notification HTTP {e.code}: {body or e}")
+        return None
     except Exception as e:
         print(f"[!] Telegram notification error: {e}")
         return None
@@ -199,23 +229,44 @@ def answer_callback_query(callback_query_id: str, text: str = ""):
         print(f"[!] Telegram answerCallbackQuery error: {e}")
 
 
-def edit_telegram_message(chat_id: str, message_id: int, text: str):
-    """Edit an existing Telegram message (and clear its inline keyboard)."""
+def edit_telegram_message(
+    chat_id: str,
+    message_id: int,
+    text: str,
+    reply_markup: dict | None = None,
+    parse_mode: str | None = None,
+) -> bool:
+    """Edit an existing Telegram message (clears inline keyboard if reply_markup is None)."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or not chat_id or not message_id:
-        return
+        return False
     try:
         url = f"https://api.telegram.org/bot{token}/editMessageText"
-        payload = {
+        markup = reply_markup if reply_markup is not None else {"inline_keyboard": []}
+        payload: dict[str, str] = {
             "chat_id": chat_id,
             "message_id": str(message_id),
             "text": text,
-            "reply_markup": json.dumps({"inline_keyboard": []}),
+            "reply_markup": json.dumps(markup),
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         data = urllib.parse.urlencode(payload).encode("utf-8")
         urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+        return True
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        if "message is not modified" in body.lower():
+            return True
+        print(f"[!] Telegram editMessageText HTTP {e.code}: {body or e}")
+        return False
     except Exception as e:
         print(f"[!] Telegram editMessageText error: {e}")
+        return False
 
 
 def hours_until_train(
@@ -338,17 +389,327 @@ def notify(title: str, message: str, page: Page | None = None, sound: bool = Tru
             pass
 
 
+def _atomic_write_json(path: Path, data):
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2))
+    os.replace(tmp_path, path)
+
+
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except Exception:
-            return {}
-    return {}
+    with _STATE_LOCK:
+        if STATE_FILE.exists():
+            try:
+                return json.loads(STATE_FILE.read_text())
+            except Exception:
+                return {}
+        return {}
 
 
 def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    with _STATE_LOCK:
+        _atomic_write_json(STATE_FILE, state)
+
+
+def load_custom_snipes() -> list[dict]:
+    with _CUSTOM_SNIPES_LOCK:
+        if CUSTOM_SNIPES_FILE.exists():
+            try:
+                data = json.loads(CUSTOM_SNIPES_FILE.read_text())
+                return data if isinstance(data, list) else []
+            except Exception:
+                return []
+        return []
+
+
+def save_custom_snipes(rules: list[dict]):
+    with _CUSTOM_SNIPES_LOCK:
+        _atomic_write_json(CUSTOM_SNIPES_FILE, rules)
+
+
+def has_completed_booking_on_date(ktmb_date: str) -> bool:
+    """True if a custom snipe (or direct /buy on that custom date) already completed on `ktmb_date`."""
+    for rule in load_custom_snipes():
+        if rule.get("date") == ktmb_date:
+            target = int(rule.get("target_pax", 1))
+            booked = int(rule.get("booked_pax", 0))
+            if rule.get("status") == "completed" or booked >= target:
+                return True
+    state = load_state()
+    custom_entry = state.get(f"CUSTOM_{ktmb_date}")
+    if isinstance(custom_entry, dict):
+        total_pax = int(os.getenv("PAX_COUNT", "2"))
+        if int(custom_entry.get("booked_pax", 0)) >= total_pax:
+            return True
+    return False
+
+
+def add_custom_snipe(
+    ymd: str,
+    origin: str,
+    destination: str,
+    start_time: str,
+    end_time: str,
+    target_pax: int | None = None,
+) -> dict:
+    """Add (or return existing active) custom one-off snipe rule and persist to custom_snipes.json."""
+    dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+    ktmb_date = format_ktmb_date(dt)
+    display_date = dt.strftime("%a, %d %b %Y")
+    start_min = _hhmm_to_minutes(start_time)
+    end_min = _hhmm_to_minutes(end_time)
+    if start_min is None or end_min is None or start_min > end_min:
+        raise ValueError(f"Invalid time window: {start_time}-{end_time}")
+    if dt < datetime.date.today():
+        raise ValueError(f"Date {display_date} is already in the past.")
+    if has_completed_booking_on_date(ktmb_date):
+        raise ValueError(f"A ticket is already booked for {display_date}. Remove/clear it first if you want another.")
+
+    pax_goal = target_pax if target_pax is not None else int(os.getenv("PAX_COUNT", "2"))
+    with _CUSTOM_SNIPES_LOCK:
+        rules: list[dict] = []
+        if CUSTOM_SNIPES_FILE.exists():
+            try:
+                loaded = json.loads(CUSTOM_SNIPES_FILE.read_text())
+                if isinstance(loaded, list):
+                    rules = loaded
+            except Exception:
+                rules = []
+
+        for existing in rules:
+            if (
+                existing.get("status") == "active"
+                and existing.get("ymd") == ymd
+                and existing.get("origin") == origin
+                and existing.get("destination") == destination
+                and existing.get("start_time") == start_time
+                and existing.get("end_time") == end_time
+            ):
+                return existing
+
+        rule = {
+            "id": str(int(time.time() * 1000)),
+            "ymd": ymd,
+            "date": ktmb_date,
+            "display_date": display_date,
+            "origin": origin,
+            "destination": destination,
+            "start_time": start_time,
+            "end_time": end_time,
+            "target_pax": pax_goal,
+            "booked_pax": 0,
+            "locked_train_time": None,
+            "skipped_times": [],
+            "status": "active",
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        rules.append(rule)
+        _atomic_write_json(CUSTOM_SNIPES_FILE, rules)
+        return rule
+
+
+def remove_custom_snipe(rule_id: str) -> dict | None:
+    """Remove a custom snipe rule by id. Returns the removed rule or None."""
+    with _CUSTOM_SNIPES_LOCK:
+        if not CUSTOM_SNIPES_FILE.exists():
+            return None
+        try:
+            rules = json.loads(CUSTOM_SNIPES_FILE.read_text())
+        except Exception:
+            return None
+        if not isinstance(rules, list):
+            return None
+        removed = None
+        kept = []
+        for r in rules:
+            if str(r.get("id")) == str(rule_id) and removed is None:
+                removed = r
+            else:
+                kept.append(r)
+        if removed is not None:
+            _atomic_write_json(CUSTOM_SNIPES_FILE, kept)
+        return removed
+
+
+def _hhmm_to_minutes(hhmm: str) -> int | None:
+    cleaned = hhmm.replace(":", "").strip()
+    if len(cleaned) != 4 or not cleaned.isdigit():
+        return None
+    h, m = int(cleaned[:2]), int(cleaned[2:])
+    if 0 <= h < 24 and 0 <= m < 60:
+        return h * 60 + m
+    return None
+
+
+def _parse_time_token(tok: str) -> str | None:
+    """Parse '19:00', '1900', '7pm', '7:30pm', '10am' into 'HH:MM'."""
+    t = tok.strip().lower()
+    m12 = re.fullmatch(r"(\d{1,2})(?::?(\d{2}))?\s*(am|pm)", t)
+    if m12:
+        h = int(m12.group(1))
+        mins = int(m12.group(2) or "0")
+        ampm = m12.group(3)
+        if not (1 <= h <= 12 and 0 <= mins < 60):
+            return None
+        if ampm == "am":
+            h = 0 if h == 12 else h
+        else:
+            h = 12 if h == 12 else h + 12
+        return f"{h:02d}:{mins:02d}"
+
+    m24 = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
+    if m24:
+        h, mins = int(m24.group(1)), int(m24.group(2))
+        if 0 <= h < 24 and 0 <= mins < 60:
+            return f"{h:02d}:{mins:02d}"
+        return None
+
+    if re.fullmatch(r"\d{4}", t):
+        h, mins = int(t[:2]), int(t[2:])
+        if 0 <= h < 24 and 0 <= mins < 60:
+            return f"{h:02d}:{mins:02d}"
+    return None
+
+
+_SNIPE_WEEKDAY_MAP = {
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
+}
+
+
+def _resolve_snipe_date(token: str, today: datetime.date | None = None) -> datetime.date | None:
+    """Resolve 'YYYYMMDD', 'today', 'tomorrow', 'friday', 'this-friday', 'next-friday' into a date."""
+    today = today or datetime.date.today()
+    t = token.strip().lower()
+    if re.fullmatch(r"\d{8}", t):
+        try:
+            return datetime.datetime.strptime(t, "%Y%m%d").date()
+        except ValueError:
+            return None
+    if t == "today":
+        return today
+    if t == "tomorrow":
+        return today + datetime.timedelta(days=1)
+
+    next_week = False
+    if t.startswith("next-") or t.startswith("next_"):
+        next_week = True
+        t = t[5:]
+    elif t.startswith("this-") or t.startswith("this_"):
+        t = t[5:]
+
+    if t in _SNIPE_WEEKDAY_MAP:
+        wd = _SNIPE_WEEKDAY_MAP[t]
+        days_ahead = (wd - today.weekday()) % 7
+        if next_week:
+            days_ahead = days_ahead + 7 if days_ahead == 0 else days_ahead + 7
+        return today + datetime.timedelta(days=days_ahead)
+    return None
+
+
+def parse_snipe_command(text: str, today: datetime.date | None = None) -> dict | None:
+    """
+    Parse `/snipe <date|weekday> <start-end> [route]` into
+    {ymd, date, display_date, origin, destination, start_time, end_time}.
+    Examples:
+      /snipe 20261120 19:00-22:00 woodlands-tebrau
+      /snipe friday 7pm-10pm woodlands-tebrau
+      /snipe this-friday 19:00-22:00 jb-woodlands
+    """
+    cleaned = text.strip()
+    parts = cleaned.split()
+    if not parts:
+        return None
+    args = parts[1:] if parts[0].startswith("/") else parts
+    if len(args) < 2:
+        return None
+
+    dt = _resolve_snipe_date(args[0], today=today)
+    if dt is None:
+        return None
+
+    time_raw = args[1].strip().lower()
+    if "-" in time_raw:
+        t_parts = time_raw.split("-", 1)
+        start_t = _parse_time_token(t_parts[0])
+        end_t = _parse_time_token(t_parts[1])
+    else:
+        start_t = _parse_time_token(time_raw)
+        end_t = start_t
+
+    if not start_t or not end_t:
+        return None
+    if _hhmm_to_minutes(start_t) > _hhmm_to_minutes(end_t):
+        return None
+
+    if len(args) >= 3:
+        route_tokens = [t for t in re.split(r"[-_/]+", args[2].lower()) if t]
+        origin = None
+        destination = None
+        for tok in route_tokens:
+            if tok in ("woodland", "woodlands", "sg", "singapore", "ciq"):
+                station = "WOODLANDS CIQ"
+            elif tok in ("tebrau", "jb", "johor", "sentral"):
+                station = "JB SENTRAL"
+            else:
+                continue
+            if origin is None:
+                origin = station
+            elif destination is None and station != origin:
+                destination = station
+        if origin is None:
+            origin = "JB SENTRAL" if dt.weekday() == 6 else "WOODLANDS CIQ"
+        if destination is None:
+            destination = "JB SENTRAL" if origin == "WOODLANDS CIQ" else "WOODLANDS CIQ"
+    else:
+        if dt.weekday() == 6:
+            origin, destination = "JB SENTRAL", "WOODLANDS CIQ"
+        else:
+            origin, destination = "WOODLANDS CIQ", "JB SENTRAL"
+
+    return {
+        "ymd": dt.strftime("%Y%m%d"),
+        "date": format_ktmb_date(dt),
+        "display_date": dt.strftime("%a, %d %b %Y"),
+        "origin": origin,
+        "destination": destination,
+        "start_time": start_t,
+        "end_time": end_t,
+    }
+
+
+def get_times_in_range(page: Page, section_selector: str, start_time: str, end_time: str) -> list[str]:
+    """Return sorted 'HH:MM' departure times visible on the page within [start_time, end_time]."""
+    start_min = _hhmm_to_minutes(start_time)
+    end_min = _hhmm_to_minutes(end_time)
+    if start_min is None or end_min is None:
+        return []
+
+    try:
+        hms = page.eval_on_selector_all(
+            f"{section_selector} tbody tr[data-hourminute]",
+            "els => els.map(e => e.getAttribute('data-hourminute'))",
+        )
+    except Exception:
+        return []
+
+    matched: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for hm in hms or []:
+        if not hm:
+            continue
+        mins = _hhmm_to_minutes(str(hm))
+        if mins is not None and start_min <= mins <= end_min:
+            fmt = f"{mins // 60:02d}:{mins % 60:02d}"
+            if fmt not in seen:
+                seen.add(fmt)
+                matched.append((mins, fmt))
+    matched.sort(key=lambda item: item[0])
+    return [fmt for _, fmt in matched]
 
 
 def format_ktmb_date(d: datetime.date) -> str:
@@ -1029,6 +1390,196 @@ def automate_passenger_and_checkout(
         return False
 
 
+def scan_custom_snipes(
+    page: Page,
+    total_pax: int,
+    split_pax: bool,
+    payment_method: str,
+    wallet_pin: str,
+    pax_names: list[str],
+    email: str = "",
+    password: str = "",
+) -> bool:
+    """
+    Scan all active one-off custom snipes (e.g. Friday 19:00-22:00) and book the earliest
+    available train in each rule's window. Never buys more than one slot on the same day.
+    Returns True if at least one active custom snipe was scanned.
+    """
+    today = datetime.date.today()
+    today_ymd = today.strftime("%Y%m%d")
+
+    rules = load_custom_snipes()
+    changed = False
+    active_rules: list[dict] = []
+
+    for rule in rules:
+        if rule.get("status") != "active":
+            continue
+        if str(rule.get("ymd", "")) < today_ymd:
+            rule["status"] = "expired"
+            changed = True
+            continue
+        target_date = rule.get("date", "")
+        rule_target_pax = int(rule.get("target_pax", total_pax))
+        if int(rule.get("booked_pax", 0)) >= rule_target_pax or has_completed_booking_on_date(target_date):
+            rule["status"] = "completed"
+            changed = True
+            continue
+        active_rules.append(rule)
+
+    if changed:
+        save_custom_snipes(rules)
+
+    if not active_rules:
+        return False
+
+    # Group active custom snipes by (origin, destination) to minimize page reloads
+    by_route: dict[tuple[str, str], list[dict]] = {}
+    for rule in sorted(active_rules, key=lambda r: str(r.get("ymd", ""))):
+        key = (rule["origin"], rule["destination"])
+        by_route.setdefault(key, []).append(rule)
+
+    for (origin, destination), route_rules in by_route.items():
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        print(
+            f"\n==================== [Custom Snipe @ {now_str}] Scanning {origin} -> {destination} ({len(route_rules)} date(s)) ===================="
+        )
+        first_rule = route_rules[0]
+        first_target = int(first_rule.get("target_pax", total_pax))
+        first_remaining = max(1, first_target - int(first_rule.get("booked_pax", 0)))
+        first_search_pax = 1 if split_pax else first_remaining
+        submit_search(page, origin, destination, first_rule["date"], "", pax=first_search_pax)
+
+        for idx, rule in enumerate(route_rules):
+            target_date = rule["date"]
+            rule_id = rule["id"]
+            rule_target_pax = int(rule.get("target_pax", total_pax))
+            booked_so_far = int(rule.get("booked_pax", 0))
+            locked_time = rule.get("locked_train_time")
+
+            if booked_so_far >= rule_target_pax or has_completed_booking_on_date(target_date):
+                continue
+
+            remaining_pax = max(1, rule_target_pax - booked_so_far)
+            search_pax = 1 if split_pax else remaining_pax
+
+            # If search_pax differs from first_search_pax, re-submit search with exact pax
+            if idx > 0 and search_pax != first_search_pax:
+                submit_search(page, origin, destination, target_date, "", pax=search_pax)
+                first_search_pax = search_pax
+            elif idx > 0:
+                is_released = switch_date_in_place(page, target_date, "")
+                if not is_released:
+                    print(f"    [{target_date:<12}] Not released yet on KTMB calendar.")
+                    continue
+            else:
+                if page.locator(".DepartSection tbody tr[data-hourminute]").count() == 0:
+                    print(f"    [{target_date:<12}] Not released yet on KTMB calendar.")
+                    continue
+
+            skipped_times = set(rule.get("skipped_times", []))
+            if locked_time:
+                candidate_times = [locked_time]
+            else:
+                candidate_times = get_times_in_range(
+                    page, ".DepartSection", rule["start_time"], rule["end_time"]
+                )
+            times_to_check = [
+                t
+                for t in candidate_times
+                if t not in skipped_times
+                and (hours_until_train(target_date, t) is None or hours_until_train(target_date, t) > 0)
+            ]
+            if not times_to_check:
+                print(
+                    f"    [{target_date:<12}] No upcoming trains in {rule['start_time']}-{rule['end_time']}"
+                )
+                continue
+
+            btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
+                page,
+                ".DepartSection",
+                times_to_check,
+                min_seats_required=search_pax,
+                date_label=target_date,
+            )
+
+            if btn:
+                if is_login_btn:
+                    print(f"[!] Custom snipe seat found on {target_date} {chosen_time} ({seats_avail} seats)! Logging in via SSO...")
+                    btn.click()
+                    page.wait_for_url("**/Account/Login**", timeout=30_000)
+                    ensure_logged_in(page, email, password)
+                    switch_date_in_place(page, target_date, "")
+                    btn, chosen_time, seats_avail, _ = find_matching_train_button(
+                        page,
+                        ".DepartSection",
+                        [chosen_time],
+                        min_seats_required=search_pax,
+                        date_label=target_date,
+                    )
+
+                if btn:
+                    print(f"[!] Custom snipe clicking Select on {target_date} {chosen_time} ({seats_avail} available)...")
+                    btn.click()
+                    nav_ok = reserve_and_wait_passenger_page(page, timeout_sec=180)
+                    if not nav_ok:
+                        print("[!] Did not reach /BookShuttle in time. Continuing scan...")
+                        break
+
+                    if search_pax >= 2:
+                        current_pax_match = [p for p in pax_names if p]
+                    else:
+                        current_pax_match = [pax_names[booked_so_far]] if booked_so_far < len(pax_names) else None
+
+                    ok = automate_passenger_and_checkout(
+                        page,
+                        payment_method,
+                        wallet_pin,
+                        current_pax_match,
+                        date_label=target_date,
+                        train_time=chosen_time,
+                    )
+                    if ok:
+                        booked_so_far += search_pax
+                        latest_rules = load_custom_snipes()
+                        for r in latest_rules:
+                            if str(r.get("id")) == str(rule_id):
+                                r["booked_pax"] = booked_so_far
+                                r["locked_train_time"] = chosen_time
+                                if booked_so_far >= rule_target_pax:
+                                    r["status"] = "completed"
+                                break
+                        save_custom_snipes(latest_rules)
+
+                        if booked_so_far >= rule_target_pax:
+                            state = load_state()
+                            state[f"CUSTOM_{target_date}"] = {
+                                "booked_pax": booked_so_far,
+                                "locked_train_time": chosen_time,
+                                "route": f"{origin} -> {destination}",
+                            }
+                            save_state(state)
+
+                        status_note = (
+                            "Day complete — will not buy another ticket on this date!"
+                            if booked_so_far >= rule_target_pax
+                            else f"Locked train {chosen_time} — waiting for remaining {rule_target_pax - booked_so_far} pax."
+                        )
+                        send_telegram(
+                            f"🎯 Custom Snipe Booked ({booked_so_far}/{rule_target_pax} pax)!\n"
+                            f"• Date: {rule.get('display_date', target_date)}\n"
+                            f"• Train: {chosen_time}\n"
+                            f"• Route: {origin} ➔ {destination}\n"
+                            f"• {status_note}"
+                        )
+                    break
+
+            time.sleep(0.4)
+
+    return True
+
+
 def scan_and_snipe_all_dates(
     page: Page,
     leg_prefix: str,
@@ -1047,10 +1598,11 @@ def scan_and_snipe_all_dates(
     single_sweep: bool = False,
     is_manual_date: bool = False,
     max_weeks: int = 36,
-):
+) -> bool:
     """
     Continuously scans through `candidate_dates` (all upcoming Sundays or Saturdays
     until the website's last released date) and books up to `total_pax` tickets on each date!
+    Returns True if a sweep was executed, False if there were no pending dates.
     """
     search_pax = 1 if split_pax else total_pax
     cycle = 1
@@ -1063,13 +1615,16 @@ def scan_and_snipe_all_dates(
             active_dates = candidate_dates
 
         state = load_state()
-        # Filter out dates that already have total_pax booked
+        # Filter out dates that already have total_pax booked (or completed via custom snipe)
         pending_dates = [
-            d for d in active_dates if int(state.get(f"{leg_prefix}_{d}", {}).get("booked_pax", 0)) < total_pax
+            d
+            for d in active_dates
+            if int(state.get(f"{leg_prefix}_{d}", {}).get("booked_pax", 0)) < total_pax
+            and not has_completed_booking_on_date(d)
         ]
         if not pending_dates:
             print(f"[+] All target dates for {leg_prefix} have {total_pax}/{total_pax} tickets booked!")
-            return
+            return False
 
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         print(
@@ -1086,7 +1641,7 @@ def scan_and_snipe_all_dates(
             booked_so_far = int(leg_state.get("booked_pax", 0))
             locked_time = leg_state.get("locked_train_time")
 
-            if booked_so_far >= total_pax:
+            if booked_so_far >= total_pax or has_completed_booking_on_date(target_date):
                 continue
 
             skipped_times = set(leg_state.get("skipped_times", []))
@@ -1205,18 +1760,21 @@ def scan_and_snipe_all_dates(
         print(f"[*] Finished full calendar sweep. Waiting {pause:g}s before next sweep...")
         time.sleep(pause)
         if single_sweep:
-            return
+            return True
 
 
 def register_telegram_bot_commands(token: str):
     """Registers slash commands with Telegram so they appear in the autocomplete popup."""
     try:
         commands = [
-            {"command": "help", "description": "Show available commands & examples"},
-            {"command": "buy", "description": "Instant buy: /buy YYYYMMDD HH:MM (e.g. /buy 20270221 22:45)"},
-            {"command": "scrap_saturday_woodlands_tebrau", "description": "PDF report for all Saturdays (Woodlands -> JB)"},
-            {"command": "scrap_sunday_tebrau_woodlands", "description": "PDF report for all Sundays (JB -> Woodlands)"},
-            {"command": "status", "description": "Show current bot booking state"},
+            {"command": "help", "description": "Open interactive bot menu"},
+            {"command": "menu", "description": "Open interactive bot menu"},
+            {"command": "snipe", "description": "Add snipe: /snipe friday 19:00-22:00 woodlands-tebrau"},
+            {"command": "status", "description": "Show snipe schedule & booking state"},
+            {"command": "buy", "description": "Instant buy: /buy YYYYMMDD HH:MM [route]"},
+            {"command": "scrap_friday_woodlands_tebrau", "description": "PDF report: Fridays (Woodlands -> JB)"},
+            {"command": "scrap_saturday_woodlands_tebrau", "description": "PDF report: Saturdays (Woodlands -> JB)"},
+            {"command": "scrap_sunday_tebrau_woodlands", "description": "PDF report: Sundays (JB -> Woodlands)"},
         ]
         data = urllib.parse.urlencode({"commands": json.dumps(commands)}).encode("utf-8")
         req = urllib.request.Request(f"https://api.telegram.org/bot{token}/setMyCommands", data=data)
@@ -1255,12 +1813,13 @@ def execute_direct_buy(text: str, chat_id: str | None = None):
     parsed = parse_buy_command(text)
     if not parsed:
         send_telegram(
-            "❌ *Invalid /buy format.*\n\n"
-            "Format:\n`/buy YYYYMMDD HH:MM`\n\n"
+            "❌ Invalid /buy format.\n\n"
+            "Format:\n/buy YYYYMMDD HH:MM [route]\n\n"
             "Examples:\n"
-            "• `/buy 20270221 22:45`\n"
-            "• `/buy 20270221 22:45 tebrau-woodlands`\n"
-            "• `/buy-day/20261114-1230-woodlands-tebrau`"
+            "• /buy 20270221 22:45\n"
+            "• /buy 20270207 20:15 tebrau-woodlands\n"
+            "• /buy 20261120 19:15 woodlands-tebrau",
+            chat_id=chat_id,
         )
         return
 
@@ -1278,12 +1837,13 @@ def execute_direct_buy(text: str, chat_id: str | None = None):
     headless = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
 
     send_telegram(
-        f"⚡ *Processing Instant Buy Request:*\n"
-        f"• Date: *{display_date}*\n"
-        f"• Train Time: *{time_fmt}*\n"
-        f"• Route: *{origin} ➔ {destination}*\n"
-        f"• Passengers: *{total_pax} Pax* ({pax_names})\n\n"
-        f"Checking availability & booking via KTM Wallet now..."
+        f"⚡ Processing Instant Buy Request:\n"
+        f"• Date: {display_date}\n"
+        f"• Train Time: {time_fmt}\n"
+        f"• Route: {origin} ➔ {destination}\n"
+        f"• Passengers: {total_pax} Pax ({pax_names})\n\n"
+        f"Checking availability & booking via KTM Wallet now...",
+        chat_id=chat_id,
     )
 
     with sync_playwright() as p:
@@ -1291,67 +1851,441 @@ def execute_direct_buy(text: str, chat_id: str | None = None):
             headless=headless,
             args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-dev-shm-usage"],
         )
-        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
 
-        submit_search(page, origin, destination, ktmb_date, "", pax=total_pax)
+            submit_search(page, origin, destination, ktmb_date, "", pax=total_pax)
 
-        btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
-            page, ".DepartSection", [time_fmt], min_seats_required=total_pax, date_label=ktmb_date
-        )
-
-        if not btn:
-            send_telegram(
-                f"❌ *Instant Buy Unavailable:*\n"
-                f"{display_date} at {time_fmt} has fewer than {total_pax} seats available right now.\n"
-                f"The 24/7 background sniper will continue monitoring for drops!"
-            )
-            browser.close()
-            return
-
-        if is_login_btn:
-            print(f"[!] Logging in via SSO for direct buy...")
-            btn.click()
-            page.wait_for_url("**/Account/Login**", timeout=30_000)
-            ensure_logged_in(page, email, password)
-            btn, chosen_time, seats_avail, _ = find_matching_train_button(
+            btn, chosen_time, seats_avail, is_login_btn = find_matching_train_button(
                 page, ".DepartSection", [time_fmt], min_seats_required=total_pax, date_label=ktmb_date
             )
 
-        if btn:
-            print(f"[!] Clicking Select for direct buy: {display_date} {chosen_time} ({seats_avail} seats)...")
-            btn.click()
-            nav_ok = reserve_and_wait_passenger_page(page, timeout_sec=180)
-            if not nav_ok:
-                send_telegram(f"❌ Timed out waiting for reCAPTCHA/reservation on {display_date} at {time_fmt}.")
-                browser.close()
+            if not btn:
+                send_telegram(
+                    f"❌ Instant Buy Unavailable:\n"
+                    f"{display_date} at {time_fmt} has fewer than {total_pax} seats available right now.\n"
+                    f"The 24/7 background sniper will continue monitoring for drops!",
+                    chat_id=chat_id,
+                )
                 return
 
-            ok = automate_passenger_and_checkout(
-                page, payment_method, wallet_pin, pax_names, date_label=ktmb_date, train_time=chosen_time
-            )
-            if ok:
-                state = load_state()
-                prefix = "SUN" if "JB" in origin else "SAT"
-                leg_key = f"{prefix}_{ktmb_date}"
-                state[leg_key] = {"booked_pax": total_pax, "locked_train_time": chosen_time}
-                save_state(state)
-                notify(
-                    "🎉 Instant Purchase Confirmed!",
-                    f"Successfully booked {total_pax} tickets for {display_date} at {chosen_time} ({origin} ➔ {destination}) via KTM Wallet!",
-                    page=page,
+            if is_login_btn:
+                print(f"[!] Logging in via SSO for direct buy...")
+                btn.click()
+                page.wait_for_url("**/Account/Login**", timeout=30_000)
+                ensure_logged_in(page, email, password)
+                btn, chosen_time, seats_avail, _ = find_matching_train_button(
+                    page, ".DepartSection", [time_fmt], min_seats_required=total_pax, date_label=ktmb_date
                 )
 
-        browser.close()
+            if btn:
+                print(f"[!] Clicking Select for direct buy: {display_date} {chosen_time} ({seats_avail} seats)...")
+                btn.click()
+                nav_ok = reserve_and_wait_passenger_page(page, timeout_sec=180)
+                if not nav_ok:
+                    send_telegram(
+                        f"❌ Timed out waiting for reCAPTCHA/reservation on {display_date} at {time_fmt}.",
+                        chat_id=chat_id,
+                    )
+                    return
+
+                ok = automate_passenger_and_checkout(
+                    page, payment_method, wallet_pin, pax_names, date_label=ktmb_date, train_time=chosen_time
+                )
+                if ok:
+                    state = load_state()
+                    dt_obj = datetime.datetime.strptime(ktmb_date, "%d %b %Y").date()
+                    wd_prefix = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][dt_obj.weekday()]
+                    if wd_prefix in ("SAT", "SUN"):
+                        leg_key = f"{wd_prefix}_{ktmb_date}"
+                    else:
+                        leg_key = f"CUSTOM_{ktmb_date}"
+                    state[leg_key] = {"booked_pax": total_pax, "locked_train_time": chosen_time}
+                    save_state(state)
+
+                    # Also mark any active custom snipe on this date complete (don't buy twice same day)
+                    rules = load_custom_snipes()
+                    updated_rules = False
+                    for r in rules:
+                        if r.get("date") == ktmb_date and r.get("status") == "active":
+                            r["booked_pax"] = int(r.get("target_pax", total_pax))
+                            r["locked_train_time"] = chosen_time
+                            r["status"] = "completed"
+                            updated_rules = True
+                    if updated_rules:
+                        save_custom_snipes(rules)
+
+                    notify(
+                        "🎉 Instant Purchase Confirmed!",
+                        f"Successfully booked {total_pax} tickets for {display_date} at {chosen_time} ({origin} ➔ {destination}) via KTM Wallet!",
+                        page=page,
+                    )
+        finally:
+            browser.close()
+
+
+def _next_date_for_weekday(weekday: int, offset_weeks: int = 0, today: datetime.date | None = None) -> datetime.date:
+    today = today or datetime.date.today()
+    days_ahead = (weekday - today.weekday()) % 7
+    return today + datetime.timedelta(days=days_ahead + offset_weeks * 7)
+
+
+def _dir_label(dir_code: str) -> tuple[str, str, str]:
+    if dir_code == "j2w":
+        return "JB SENTRAL", "WOODLANDS CIQ", "JB Sentral ➔ Woodlands CIQ"
+    return "WOODLANDS CIQ", "JB SENTRAL", "Woodlands CIQ ➔ JB Sentral"
+
+
+def _build_main_menu() -> tuple[str, dict]:
+    active_custom = [r for r in load_custom_snipes() if r.get("status") == "active"]
+    mode = os.getenv("BOOKING_MODE", "single_sun")
+    text = (
+        "🤖 KTMB Shuttle Tebrau Bot Menu\n\n"
+        f"• Active Mode: {mode}\n"
+        f"• Custom Snipes Scheduled: {len(active_custom)}\n\n"
+        "Tap an option below:"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🎯 Add Snipe Schedule", "callback_data": "menu:snipe_add"},
+                {"text": "📋 My Schedule & Status", "callback_data": "menu:status"},
+            ],
+            [
+                {"text": "📊 Scrap PDF Report", "callback_data": "menu:scrap"},
+                {"text": "⚡ Instant Buy Guide", "callback_data": "menu:buy"},
+            ],
+            [
+                {"text": "🗑 Remove Custom Snipe", "callback_data": "menu:snipe_del"},
+                {"text": "🔄 Refresh", "callback_data": "menu:main"},
+            ],
+        ]
+    }
+    return text, keyboard
+
+
+def _build_snipe_date_menu(today: datetime.date | None = None) -> tuple[str, dict]:
+    today = today or datetime.date.today()
+    fri0 = _next_date_for_weekday(4, 0, today)
+    sat0 = _next_date_for_weekday(5, 0, today)
+    sun0 = _next_date_for_weekday(6, 0, today)
+    fri1 = _next_date_for_weekday(4, 1, today)
+    sat1 = _next_date_for_weekday(5, 1, today)
+    sun1 = _next_date_for_weekday(6, 1, today)
+
+    def _btn(dt: datetime.date, tag: str) -> dict:
+        return {
+            "text": f"📅 {dt.strftime('%a %d %b')} ({tag})",
+            "callback_data": f"snipe_date:{dt.strftime('%Y%m%d')}",
+        }
+
+    text = (
+        "🎯 Add Custom Snipe — Step 1/3: Pick Date\n\n"
+        "Choose a date below (it will be added to your live sniping schedule and stop automatically after snatching 1 slot on that day).\n\n"
+        "Or send a custom command anytime:\n"
+        "/snipe YYYYMMDD HH:MM-HH:MM route\n"
+        "Example: /snipe 20261120 19:00-22:00 woodlands-tebrau"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [_btn(fri0, "This Fri"), _btn(sat0, "This Sat")],
+            [_btn(sun0, "This Sun"), _btn(fri1, "Next Fri")],
+            [_btn(sat1, "Next Sat"), _btn(sun1, "Next Sun")],
+            [{"text": "⬅️ Back to Menu", "callback_data": "menu:main"}],
+        ]
+    }
+    return text, keyboard
+
+
+def _build_snipe_dir_menu(ymd: str) -> tuple[str, dict]:
+    dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+    label = dt.strftime("%a, %d %b %Y")
+    text = (
+        f"🎯 Add Custom Snipe — Step 2/3: Pick Direction\n\n"
+        f"• Date: {label}\n\n"
+        f"Which direction do you want to travel?"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "🇸🇬➔🇲🇾 Woodlands CIQ ➔ JB Sentral", "callback_data": f"snipe_dir:{ymd}:w2j"}],
+            [{"text": "🇲🇾➔🇸🇬 JB Sentral ➔ Woodlands CIQ", "callback_data": f"snipe_dir:{ymd}:j2w"}],
+            [{"text": "⬅️ Back (Change Date)", "callback_data": "menu:snipe_add"}],
+        ]
+    }
+    return text, keyboard
+
+
+def _build_snipe_time_menu(ymd: str, dir_code: str) -> tuple[str, dict]:
+    dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+    label = dt.strftime("%a, %d %b %Y")
+    _, _, route_str = _dir_label(dir_code)
+    text = (
+        f"🎯 Add Custom Snipe — Step 3/3: Pick Time Window\n\n"
+        f"• Date: {label}\n"
+        f"• Route: {route_str}\n\n"
+        f"The bot will pick the earliest available train in your selected window and stop after booking that day.\n\n"
+        f"Need another window? Send:\n"
+        f"/snipe {ymd} HH:MM-HH:MM {'woodlands-tebrau' if dir_code == 'w2j' else 'tebrau-woodlands'}"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "🌆 7pm – 10pm (19:00-22:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1900-2200"},
+            ],
+            [
+                {"text": "🌇 5pm – 9pm (17:00-21:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1700-2100"},
+                {"text": "🌙 6pm – 11pm (18:00-23:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1800-2300"},
+            ],
+            [
+                {"text": "☀️ 12pm – 3pm (12:00-15:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1200-1500"},
+                {"text": "🌅 8am – 12pm (08:00-12:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:0800-1200"},
+            ],
+            [{"text": "⬅️ Back (Change Direction)", "callback_data": f"snipe_date:{ymd}"}],
+        ]
+    }
+    return text, keyboard
+
+
+def _build_scrap_menu() -> tuple[str, dict]:
+    text = (
+        "📊 On-Demand Available Seats PDF Reports\n\n"
+        "Tap any report below to scrape live seats and receive a PDF:\n\n"
+        "For a specific date, send:\n"
+        "/scrap-day/YYYYMMDD-woodlands-tebrau\n"
+        "/scrap-day/YYYYMMDD-tebrau-woodlands"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "📄 Fridays: Woodlands ➔ JB", "callback_data": "scrap_run:fri_w2j"},
+                {"text": "📄 Fridays: JB ➔ Woodlands", "callback_data": "scrap_run:fri_j2w"},
+            ],
+            [
+                {"text": "📄 Saturdays: Woodlands ➔ JB", "callback_data": "scrap_run:sat_w2j"},
+                {"text": "📄 Saturdays: JB ➔ Woodlands", "callback_data": "scrap_run:sat_j2w"},
+            ],
+            [
+                {"text": "📄 Sundays: JB ➔ Woodlands", "callback_data": "scrap_run:sun_j2w"},
+                {"text": "📄 Sundays: Woodlands ➔ JB", "callback_data": "scrap_run:sun_w2j"},
+            ],
+            [{"text": "⬅️ Back to Menu", "callback_data": "menu:main"}],
+        ]
+    }
+    return text, keyboard
+
+
+def _build_status_menu() -> tuple[str, dict]:
+    custom_rules = load_custom_snipes()
+    state = load_state()
+
+    custom_lines = []
+    for r in custom_rules:
+        status = r.get("status", "active")
+        icon = {"active": "🟢", "completed": "✅", "expired": "⌛"}.get(status, "•")
+        route = f"{'Woodlands➔JB' if r.get('origin') == 'WOODLANDS CIQ' else 'JB➔Woodlands'}"
+        booked = int(r.get("booked_pax", 0))
+        target = int(r.get("target_pax", 2))
+        locked = f" @ {r.get('locked_train_time')}" if r.get("locked_train_time") else ""
+        custom_lines.append(
+            f"{icon} {r.get('display_date', r.get('date'))} | {route} | {r.get('start_time')}-{r.get('end_time')} | {booked}/{target} pax{locked}"
+        )
+
+    state_lines = []
+    for k, v in state.items():
+        if not isinstance(v, dict):
+            continue
+        skipped = v.get("skipped_times")
+        skip_note = f" (skipped: {', '.join(skipped)})" if skipped else ""
+        state_lines.append(
+            f"• {k}: {v.get('booked_pax', 0)} pax booked at {v.get('locked_train_time')}{skip_note}"
+        )
+
+    custom_block = "\n".join(custom_lines) if custom_lines else "None scheduled."
+    state_block = "\n".join(state_lines) if state_lines else "No bookings recorded yet."
+    text = (
+        f"📋 Current Snipe Schedule & Bookings\n\n"
+        f"🎯 Custom One-Off Snipes:\n{custom_block}\n\n"
+        f"🔁 Recorded Bookings:\n{state_block}"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "➕ Add Snipe", "callback_data": "menu:snipe_add"},
+                {"text": "🗑 Remove Snipe", "callback_data": "menu:snipe_del"},
+            ],
+            [
+                {"text": "🔄 Refresh", "callback_data": "menu:status"},
+                {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+            ],
+        ]
+    }
+    return text, keyboard
+
+
+def _build_snipe_del_menu() -> tuple[str, dict]:
+    rules = load_custom_snipes()
+    rows = []
+    for r in rules:
+        route = "W➔JB" if r.get("origin") == "WOODLANDS CIQ" else "JB➔W"
+        status = r.get("status", "active")
+        rows.append(
+            [
+                {
+                    "text": f"❌ [{status}] {r.get('date')} {route} {r.get('start_time')}-{r.get('end_time')}",
+                    "callback_data": f"snipe_rm:{r.get('id')}",
+                }
+            ]
+        )
+    rows.append([{"text": "⬅️ Back to Menu", "callback_data": "menu:main"}])
+    text = (
+        "🗑 Remove Custom Snipe\n\n"
+        + ("Tap a rule below to remove it:" if rules else "No custom snipes found.")
+    )
+    return text, {"inline_keyboard": rows}
+
+
+def _build_buy_guide_menu() -> tuple[str, dict]:
+    text = (
+        "⚡ Instant Ticket Buy Guide\n\n"
+        "Send a command to immediately check, lock & pay via KTM Wallet:\n\n"
+        "Format:\n"
+        "/buy YYYYMMDD HH:MM [route]\n\n"
+        "Examples:\n"
+        "• /buy 20261120 19:15 woodlands-tebrau\n"
+        "• /buy 20270221 22:45 tebrau-woodlands\n"
+        "• /buy 20261114 12:30 woodlands-tebrau"
+    )
+    keyboard = {
+        "inline_keyboard": [[{"text": "⬅️ Back to Menu", "callback_data": "menu:main"}]]
+    }
+    return text, keyboard
+
+
+_SCRAP_CALLBACK_MAP = {
+    "fri_w2j": ("/scrap-friday-woodlands-tebrau", "Fridays (Woodlands CIQ ➔ JB Sentral)"),
+    "fri_j2w": ("/scrap-friday-tebrau-woodlands", "Fridays (JB Sentral ➔ Woodlands CIQ)"),
+    "sat_w2j": ("/scrap-saturday-woodlands-tebrau", "Saturdays (Woodlands CIQ ➔ JB Sentral)"),
+    "sat_j2w": ("/scrap-saturday-tebrau-woodlands", "Saturdays (JB Sentral ➔ Woodlands CIQ)"),
+    "sun_j2w": ("/scrap-sunday-tebrau-woodlands", "Sundays (JB Sentral ➔ Woodlands CIQ)"),
+    "sun_w2j": ("/scrap-sunday-woodlands-tebrau", "Sundays (Woodlands CIQ ➔ JB Sentral)"),
+}
+
+
+def handle_menu_callback(cb_id: str, cb_data: str, chat_id: str, message_id: int | None):
+    """Handle interactive /help menu button callbacks."""
+    if cb_data == "menu:main":
+        answer_callback_query(cb_id)
+        text, kb = _build_main_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "menu:snipe_add":
+        answer_callback_query(cb_id)
+        text, kb = _build_snipe_date_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "menu:scrap":
+        answer_callback_query(cb_id)
+        text, kb = _build_scrap_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "menu:status":
+        answer_callback_query(cb_id)
+        text, kb = _build_status_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "menu:snipe_del":
+        answer_callback_query(cb_id)
+        text, kb = _build_snipe_del_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "menu:buy":
+        answer_callback_query(cb_id)
+        text, kb = _build_buy_guide_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("snipe_date:"):
+        ymd = cb_data.split(":", 1)[1]
+        answer_callback_query(cb_id)
+        text, kb = _build_snipe_dir_menu(ymd)
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("snipe_dir:"):
+        parts = cb_data.split(":")
+        if len(parts) == 3:
+            _, ymd, dir_code = parts
+            answer_callback_query(cb_id)
+            text, kb = _build_snipe_time_menu(ymd, dir_code)
+            if chat_id and message_id:
+                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("snipe_time:"):
+        parts = cb_data.split(":")
+        if len(parts) == 4:
+            _, ymd, dir_code, time_range = parts
+            start_raw, end_raw = time_range.split("-", 1)
+            start_fmt = f"{start_raw[:2]}:{start_raw[2:]}"
+            end_fmt = f"{end_raw[:2]}:{end_raw[2:]}"
+            origin, destination, route_str = _dir_label(dir_code)
+            try:
+                rule = add_custom_snipe(ymd, origin, destination, start_fmt, end_fmt)
+                answer_callback_query(cb_id, "✅ Snipe added to schedule!")
+                text = (
+                    f"✅ Added to Live Sniping Schedule!\n\n"
+                    f"• Date: {rule['display_date']}\n"
+                    f"• Route: {route_str}\n"
+                    f"• Window: {start_fmt} – {end_fmt} (earliest available)\n"
+                    f"• Target: {rule['target_pax']} pax\n"
+                    f"• Rule: Auto-stops once a slot is snatched on this day."
+                )
+            except Exception as e:
+                answer_callback_query(cb_id, f"❌ {e}")
+                text = f"❌ Could not add snipe: {e}"
+            kb = {
+                "inline_keyboard": [
+                    [
+                        {"text": "📋 View Schedule", "callback_data": "menu:status"},
+                        {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+                    ]
+                ]
+            }
+            if chat_id and message_id:
+                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("snipe_rm:"):
+        rule_id = cb_data.split(":", 1)[1]
+        removed = remove_custom_snipe(rule_id)
+        if removed:
+            answer_callback_query(cb_id, f"🗑 Removed {removed.get('date')}")
+        else:
+            answer_callback_query(cb_id, "Rule already removed.")
+        text, kb = _build_snipe_del_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("scrap_run:"):
+        key = cb_data.split(":", 1)[1]
+        entry = _SCRAP_CALLBACK_MAP.get(key)
+        if not entry:
+            answer_callback_query(cb_id, "Unknown report option.")
+            return
+        scrap_cmd, label = entry
+        answer_callback_query(cb_id, "⏳ Generating PDF report...")
+        send_telegram(
+            f"⏳ Generating available seats PDF report for {label}... Please wait ~10-15s.",
+            chat_id=chat_id,
+        )
+        threading.Thread(
+            target=run_side_job,
+            args=(handle_scrape_command, scrap_cmd, chat_id),
+            daemon=True,
+        ).start()
 
 
 def start_telegram_command_listener():
-    """Background listener for Telegram commands (/scrap-saturday-woodlands-tebrau, /help, etc.)."""
+    """Background listener for Telegram commands (/help, /menu, /snipe, /scrap..., /buy, /status)."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         return
 
     register_telegram_bot_commands(token)
-    print("[*] Telegram command listener started (listening for /scrap, /help, /status)")
+    print("[*] Telegram command listener started (listening for /help, /menu, /snipe, /scrap, /buy, /status)")
     last_update_id = 0
 
     while True:
@@ -1393,67 +2327,105 @@ def start_telegram_command_listener():
                                 answer_callback_query(cb_id, "This confirmation prompt has expired.")
                                 if cb_chat_id and cb_msg_id:
                                     edit_telegram_message(cb_chat_id, cb_msg_id, f"{cb_orig_text}\n\n⏱️ Expired.")
+                    else:
+                        handle_menu_callback(cb_id, cb_data, cb_chat_id, cb_msg_id)
                     continue
 
                 msg = update.get("message") or update.get("channel_post")
                 if not msg:
                     continue
                 text = msg.get("text", "").strip()
+                if not text:
+                    continue
                 chat_id = str(msg["chat"]["id"])
 
                 # Normalize command if bot username is appended (e.g. /help@MyBot)
-                cmd_clean = text.split("@")[0].lower()
+                cmd_name = text.split()[0].split("@")[0].lower()
 
-                if cmd_clean.startswith("/buy"):
+                if cmd_name.startswith("/buy"):
                     print(f"[*] Received Telegram /buy command: '{text}' from chat {chat_id}")
                     threading.Thread(
                         target=run_side_job,
                         args=(execute_direct_buy, text, chat_id),
                         daemon=True,
                     ).start()
-                elif cmd_clean.startswith("/scrap"):
+                elif cmd_name.startswith("/scrap"):
                     print(f"[*] Received Telegram command: '{text}' from chat {chat_id}")
-                    send_telegram(f"⏳ Generating available seats PDF report for `{text}`... Please wait ~10-15s.")
-                    threading.Thread(
-                        target=run_side_job,
-                        args=(handle_scrape_command, text, chat_id),
-                        daemon=True,
-                    ).start()
-                elif cmd_clean == "/status":
-                    state = load_state()
-                    summary_lines = []
-                    for k, v in state.items():
-                        skipped = v.get("skipped_times")
-                        skip_note = f" (skipped: {', '.join(skipped)})" if skipped else ""
-                        summary_lines.append(
-                            f"• *{k}*: {v.get('booked_pax', 0)} pax booked at {v.get('locked_train_time')}{skip_note}"
+                    if parse_scrape_command(text) is None:
+                        send_telegram(
+                            f"❌ Unrecognized /scrap command: {text}\n\n"
+                            "Examples:\n"
+                            "• /scrap-friday-woodlands-tebrau\n"
+                            "• /scrap-saturday-woodlands-tebrau\n"
+                            "• /scrap-sunday-tebrau-woodlands\n"
+                            "• /scrap-day/20261120-woodlands-tebrau",
+                            reply_markup={"inline_keyboard": [[{"text": "📊 Open PDF Menu", "callback_data": "menu:scrap"}]]},
+                            chat_id=chat_id,
                         )
-                    state_msg = "\n".join(summary_lines) if summary_lines else "No bookings recorded yet."
-                    send_telegram(f"📋 *Current Bot Booking State:*\n\n{state_msg}")
-                elif cmd_clean in ("/help", "/start"):
-                    help_msg = (
-                        "🤖 *KTMB Shuttle Tebrau Bot Commands*\n\n"
-                        "⚡ *Instant Buy Tickets:*\n"
-                        "• `/buy YYYYMMDD HH:MM`\n"
-                        "  _Instantly checks, locks & pays via KTM Wallet for 2 Pax. Examples:_\n"
-                        "  `/buy 20270221 22:45`\n"
-                        "  `/buy 20270207 20:15 tebrau-woodlands`\n"
-                        "  `/buy 20261114 12:30 woodlands-tebrau`\n\n"
-                        "📌 *On-Demand PDF Reports:*\n"
-                        "• `/scrap-saturday-woodlands-tebrau`\n"
-                        "  _Generates a PDF of all released Saturdays (Woodlands CIQ ➔ JB Sentral) showing only available seats._\n\n"
-                        "• `/scrap-sunday-tebrau-woodlands`\n"
-                        "  _Generates a PDF of all released Sundays (JB Sentral ➔ Woodlands CIQ) showing only available seats._\n\n"
-                        "• `/scrap-day/YYYYMMDD-departure-arrival`\n"
-                        "  _Generates a PDF for a specific date and route. Examples:_\n"
-                        "  `/scrap-day/20261114-woodlands-tebrau`\n"
-                        "  `/scrap-day/20261115-tebrau-woodlands`\n"
-                        "  `/scrap-day/20270207-jb-woodlands`\n\n"
-                        "📌 *Status & Monitoring:*\n"
-                        "• `/status` — View which dates/trains have been booked so far."
-                    )
-                    send_telegram(help_msg)
-        except Exception:
+                    else:
+                        send_telegram(
+                            f"⏳ Generating available seats PDF report for {text}... Please wait ~10-15s.",
+                            chat_id=chat_id,
+                        )
+                        threading.Thread(
+                            target=run_side_job,
+                            args=(handle_scrape_command, text, chat_id),
+                            daemon=True,
+                        ).start()
+                elif cmd_name == "/snipe":
+                    print(f"[*] Received Telegram /snipe command: '{text}' from chat {chat_id}")
+                    if len(text.split()) == 1:
+                        menu_text, menu_kb = _build_snipe_date_menu()
+                        send_telegram(menu_text, reply_markup=menu_kb, chat_id=chat_id)
+                    else:
+                        parsed_snipe = parse_snipe_command(text)
+                        if not parsed_snipe:
+                            send_telegram(
+                                "❌ Invalid /snipe format.\n\n"
+                                "Format: /snipe <date|weekday> <start-end> [route]\n"
+                                "Examples:\n"
+                                "• /snipe friday 19:00-22:00 woodlands-tebrau\n"
+                                "• /snipe 20261120 7pm-10pm woodlands-tebrau\n"
+                                "• /snipe 20261122 19:00-22:00 tebrau-woodlands",
+                                reply_markup={"inline_keyboard": [[{"text": "🎯 Pick via Menu", "callback_data": "menu:snipe_add"}]]},
+                                chat_id=chat_id,
+                            )
+                        else:
+                            try:
+                                rule = add_custom_snipe(
+                                    parsed_snipe["ymd"],
+                                    parsed_snipe["origin"],
+                                    parsed_snipe["destination"],
+                                    parsed_snipe["start_time"],
+                                    parsed_snipe["end_time"],
+                                )
+                                send_telegram(
+                                    f"✅ Added to Live Sniping Schedule!\n\n"
+                                    f"• Date: {rule['display_date']}\n"
+                                    f"• Route: {rule['origin']} ➔ {rule['destination']}\n"
+                                    f"• Window: {rule['start_time']} – {rule['end_time']} (earliest available)\n"
+                                    f"• Target: {rule['target_pax']} pax\n"
+                                    f"• Rule: Auto-stops once a slot is snatched on this day.",
+                                    reply_markup={
+                                        "inline_keyboard": [
+                                            [
+                                                {"text": "📋 View Schedule", "callback_data": "menu:status"},
+                                                {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+                                            ]
+                                        ]
+                                    },
+                                    chat_id=chat_id,
+                                )
+                            except Exception as e:
+                                send_telegram(f"❌ Could not add snipe: {e}", chat_id=chat_id)
+                elif cmd_name == "/status":
+                    status_text, status_kb = _build_status_menu()
+                    send_telegram(status_text, reply_markup=status_kb, chat_id=chat_id)
+                elif cmd_name in ("/help", "/menu", "/start"):
+                    menu_text, menu_kb = _build_main_menu()
+                    send_telegram(menu_text, reply_markup=menu_kb, chat_id=chat_id)
+        except Exception as e:
+            print(f"[!] Telegram listener loop error: {e}")
             time.sleep(3)
 
 
@@ -1501,6 +2473,7 @@ def main():
         print(f"  Saturday (SG -> JB): Scanning all released Saturdays ({sat_dates[0]} -> ...) | Trains: {sat_times}")
     if args.mode in ("auto_weekend", "single_sun"):
         print(f"  Sunday   (JB -> SG): Scanning all released Sundays ({sun_dates[0]} -> ...) | Trains: {sun_times}")
+    print(f"  Custom Snipes      : {len([r for r in load_custom_snipes() if r.get('status') == 'active'])} active (editable via Telegram /help)")
     print(f"  Total Tickets/Date : {total_pax} Pax (Split 1+1 Snipe: {split_pax}) | Passengers: {pax_names}")
     print(
         f"  Sweep Interval     : {args.interval:g}s daytime | "
@@ -1537,68 +2510,18 @@ def main():
                 time.sleep(0.5)
 
         if args.mode == "single_sun":
-            scan_and_snipe_all_dates(
-                page=page,
-                leg_prefix="SUN",
-                origin="JB SENTRAL",
-                destination="WOODLANDS CIQ",
-                candidate_dates=sun_dates,
-                preferred_times=sun_times,
-                total_pax=total_pax,
-                split_pax=split_pax,
-                poll_interval=args.interval,
-                payment_method=payment_method,
-                wallet_pin=wallet_pin,
-                pax_names=pax_names,
-                email=email,
-                password=password,
-                single_sweep=False,
-                is_manual_date=bool(args.sun_date),
-                max_weeks=args.max_weeks,
-            )
-        elif args.mode == "single_sat":
-            scan_and_snipe_all_dates(
-                page=page,
-                leg_prefix="SAT",
-                origin="WOODLANDS CIQ",
-                destination="JB SENTRAL",
-                candidate_dates=sat_dates,
-                preferred_times=sat_times,
-                total_pax=total_pax,
-                split_pax=split_pax,
-                poll_interval=args.interval,
-                payment_method=payment_method,
-                wallet_pin=wallet_pin,
-                pax_names=pax_names,
-                email=email,
-                password=password,
-                single_sweep=False,
-                is_manual_date=bool(args.sat_date),
-                max_weeks=args.max_weeks,
-            )
-        else:  # auto_weekend
-            # Alternate sweeping all Saturdays and all Sundays
             while True:
-                scan_and_snipe_all_dates(
+                scan_custom_snipes(
                     page=page,
-                    leg_prefix="SAT",
-                    origin="WOODLANDS CIQ",
-                    destination="JB SENTRAL",
-                    candidate_dates=sat_dates,
-                    preferred_times=sat_times,
                     total_pax=total_pax,
                     split_pax=split_pax,
-                    poll_interval=args.interval,
                     payment_method=payment_method,
                     wallet_pin=wallet_pin,
                     pax_names=pax_names,
                     email=email,
                     password=password,
-                    single_sweep=True,
-                    is_manual_date=bool(args.sat_date),
-                    max_weeks=args.max_weeks,
                 )
-                scan_and_snipe_all_dates(
+                ran = scan_and_snipe_all_dates(
                     page=page,
                     leg_prefix="SUN",
                     origin="JB SENTRAL",
@@ -1617,6 +2540,103 @@ def main():
                     is_manual_date=bool(args.sun_date),
                     max_weeks=args.max_weeks,
                 )
+                if not ran:
+                    maybe_recycle(page)
+                    pause = current_poll_interval(args.interval)
+                    print(f"[*] Finished sweep. Waiting {pause:g}s before next sweep...")
+                    time.sleep(pause)
+        elif args.mode == "single_sat":
+            while True:
+                scan_custom_snipes(
+                    page=page,
+                    total_pax=total_pax,
+                    split_pax=split_pax,
+                    payment_method=payment_method,
+                    wallet_pin=wallet_pin,
+                    pax_names=pax_names,
+                    email=email,
+                    password=password,
+                )
+                ran = scan_and_snipe_all_dates(
+                    page=page,
+                    leg_prefix="SAT",
+                    origin="WOODLANDS CIQ",
+                    destination="JB SENTRAL",
+                    candidate_dates=sat_dates,
+                    preferred_times=sat_times,
+                    total_pax=total_pax,
+                    split_pax=split_pax,
+                    poll_interval=args.interval,
+                    payment_method=payment_method,
+                    wallet_pin=wallet_pin,
+                    pax_names=pax_names,
+                    email=email,
+                    password=password,
+                    single_sweep=True,
+                    is_manual_date=bool(args.sat_date),
+                    max_weeks=args.max_weeks,
+                )
+                if not ran:
+                    maybe_recycle(page)
+                    pause = current_poll_interval(args.interval)
+                    print(f"[*] Finished sweep. Waiting {pause:g}s before next sweep...")
+                    time.sleep(pause)
+        else:  # auto_weekend
+            # Sweep custom snipes, then alternate Saturdays and Sundays
+            while True:
+                scan_custom_snipes(
+                    page=page,
+                    total_pax=total_pax,
+                    split_pax=split_pax,
+                    payment_method=payment_method,
+                    wallet_pin=wallet_pin,
+                    pax_names=pax_names,
+                    email=email,
+                    password=password,
+                )
+                ran_sat = scan_and_snipe_all_dates(
+                    page=page,
+                    leg_prefix="SAT",
+                    origin="WOODLANDS CIQ",
+                    destination="JB SENTRAL",
+                    candidate_dates=sat_dates,
+                    preferred_times=sat_times,
+                    total_pax=total_pax,
+                    split_pax=split_pax,
+                    poll_interval=args.interval,
+                    payment_method=payment_method,
+                    wallet_pin=wallet_pin,
+                    pax_names=pax_names,
+                    email=email,
+                    password=password,
+                    single_sweep=True,
+                    is_manual_date=bool(args.sat_date),
+                    max_weeks=args.max_weeks,
+                )
+                ran_sun = scan_and_snipe_all_dates(
+                    page=page,
+                    leg_prefix="SUN",
+                    origin="JB SENTRAL",
+                    destination="WOODLANDS CIQ",
+                    candidate_dates=sun_dates,
+                    preferred_times=sun_times,
+                    total_pax=total_pax,
+                    split_pax=split_pax,
+                    poll_interval=args.interval,
+                    payment_method=payment_method,
+                    wallet_pin=wallet_pin,
+                    pax_names=pax_names,
+                    email=email,
+                    password=password,
+                    single_sweep=True,
+                    is_manual_date=bool(args.sun_date),
+                    max_weeks=args.max_weeks,
+                )
+                if not ran_sat and not ran_sun:
+                    maybe_recycle(page)
+                    pause = current_poll_interval(args.interval)
+                    print(f"[*] Finished sweep. Waiting {pause:g}s before next sweep...")
+                    time.sleep(pause)
 
 
 if __name__ == "__main__":
