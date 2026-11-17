@@ -56,9 +56,25 @@ journalctl -u ktmb-sniper.service -f
 
 ---
 
-## ⚡ Telegram Commands
+## ⚡ Telegram Commands & Interactive Menu
 
-### 1. Instant Ticket Buying (`/buy`)
+Send **`/help`** (or **`/menu`**) in your Telegram channel or bot chat to open the interactive inline button menu:
+- **🎯 Add Snipe Schedule**: Pick Date (e.g. This Friday) ➔ Pick Direction ➔ Pick Time Window (e.g. `19:00–22:00`). Added directly into the live background sniping loop, picks the earliest available train in that window, and automatically stops after snatching 1 slot on that day.
+- **📋 My Schedule & Status**: View active custom snipes and recorded weekend bookings.
+- **📊 Scrap PDF Report**: One-tap PDF reports for Fridays, Saturdays, or Sundays in either direction.
+- **🗑 Remove Custom Snipe**: Cancel any scheduled custom snipe.
+
+### 1. Custom One-Off Snipe (`/snipe`)
+You can also add a custom snipe target via command:
+```
+/snipe <date|weekday> <start-end> [route]
+```
+**Examples:**
+* `/snipe friday 19:00-22:00 woodlands-tebrau` — Snipes this Friday `19:00–22:00` (`Woodlands CIQ ➔ JB Sentral`), picking the earliest available train and stopping once booked on that day.
+* `/snipe 20261120 7pm-10pm woodlands-tebrau` — Same using explicit `YYYYMMDD` and 12-hour times.
+* `/snipe 20261122 19:00-22:00 tebrau-woodlands` — Snipes `JB Sentral ➔ Woodlands CIQ`.
+
+### 2. Instant Ticket Buying (`/buy`)
 You can trigger an immediate booking right from Telegram without waiting for the background loop:
 ```
 /buy YYYYMMDD HH:MM [optional-route]
@@ -80,17 +96,19 @@ The bot will:
 
 ## 📊 Telegram PDF Scraping Commands
 
-You can send commands directly into your Telegram channel or direct bot chat at any time, and the bot will scrape live availability and upload an A4 PDF report showing **only the timeslots that currently have available seats**:
+You can send commands directly into your Telegram channel or direct bot chat (or tap them in `/help` ➔ **Scrap PDF Report**), and the bot will scrape live availability and upload an A4 PDF report showing **only the timeslots that currently have available seats**:
 
-1. **`/scrap-saturday-woodlands-tebrau`**
-   - Scrapes all released upcoming Saturdays for `Woodlands CIQ ➔ JB Sentral`.
+1. **`/scrap-friday-woodlands-tebrau`** (or `/scrap-friday-tebrau-woodlands`)
+   - Scrapes all released upcoming Fridays for the requested direction.
    - Sends a formatted PDF with all available timeslots & seat counts.
 
-2. **`/scrap-sunday-tebrau-woodlands`**
-   - Scrapes all released upcoming Sundays for `JB Sentral ➔ Woodlands CIQ`.
-   - Sends a formatted PDF with all available timeslots & seat counts.
+2. **`/scrap-saturday-woodlands-tebrau`** (or `/scrap-saturday-tebrau-woodlands`)
+   - Scrapes all released upcoming Saturdays for the requested direction.
 
-3. **`/scrap-day/YYYYMMDD-departure-arrival`**
+3. **`/scrap-sunday-tebrau-woodlands`** (or `/scrap-sunday-woodlands-tebrau`)
+   - Scrapes all released upcoming Sundays for the requested direction.
+
+4. **`/scrap-day/YYYYMMDD-departure-arrival`**
    - Scrapes a single specific date and route. Examples:
      - `/scrap-day/20261114-woodlands-tebrau`
      - `/scrap-day/20261115-tebrau-woodlands`
