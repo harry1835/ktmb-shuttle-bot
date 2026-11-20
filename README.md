@@ -63,6 +63,7 @@ Send **`/help`** (or **`/menu`**) in your Telegram channel or bot chat to open t
 - **📋 My Schedule & Status**: View active custom snipes and recorded weekend bookings.
 - **📊 Scrap PDF Report**: One-tap PDF reports for Fridays, Saturdays, or Sundays in either direction.
 - **🗑 Remove Custom Snipe**: Cancel any scheduled custom snipe.
+- **🔄 Update Bot** (or **`/update`** / **`/restart`**): Pulls the latest `origin/main` from GitHub and restarts `ktmb-sniper.service` automatically, confirming once back online.
 
 ### 1. Custom One-Off Snipe (`/snipe`)
 You can also add or narrow a custom snipe target via command:

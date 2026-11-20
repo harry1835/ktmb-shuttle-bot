@@ -48,16 +48,18 @@ ROOT_DIR = Path(__file__).parent.resolve()
 USER_DATA_DIR = ROOT_DIR / "browser_profile"
 STATE_FILE = ROOT_DIR / "bookings_state.json"
 CUSTOM_SNIPES_FILE = ROOT_DIR / "custom_snipes.json"
+UPDATE_NOTIFY_FILE = ROOT_DIR / ".update_notify.json"
 SCREENSHOT_DIR = ROOT_DIR / "screenshots"
 
 # Memory hygiene: Chromium + the Playwright driver grow steadily when one page is polled
 # for days, so the process exits at a safe point every RECYCLE_MINUTES and systemd
 # (Restart=always) starts a fresh one. The persistent browser profile keeps the session.
 _PROCESS_START = time.monotonic()
-# Held by /buy and /scrap jobs: allows one extra Chromium at a time and blocks a recycle mid-job.
+# Held by /buy, /scrap, and /update jobs: allows one extra job at a time and blocks a recycle mid-job.
 _SIDE_JOB_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
 _CUSTOM_SNIPES_LOCK = threading.Lock()
+_RESTART_EVENT = threading.Event()
 
 
 class RecycleRequested(Exception):
@@ -102,8 +104,21 @@ def current_poll_interval(base_interval: float, now: datetime.datetime | None = 
     return base_interval
 
 
+def sleep_or_wake(seconds: float) -> bool:
+    """Sleep up to `seconds`, returning True early if a restart was requested."""
+    return _RESTART_EVENT.wait(timeout=max(0.0, seconds))
+
+
 def maybe_recycle(page: Page):
-    """Between sweeps: if the process is older than RECYCLE_MINUTES, close the browser and exit."""
+    """Between sweeps: exit cleanly if /update requested restart or process is older than RECYCLE_MINUTES."""
+    if _RESTART_EVENT.is_set():
+        print("[*] Restart requested via Telegram /update. Closing browser cleanly and exiting...")
+        try:
+            page.context.close()
+        except Exception:
+            pass
+        raise RecycleRequested()
+
     recycle_minutes = float(os.getenv("RECYCLE_MINUTES", "60"))
     # Only under systemd (which sets INVOCATION_ID): a manual run has nothing to restart it.
     if not os.getenv("INVOCATION_ID"):
@@ -123,6 +138,131 @@ def maybe_recycle(page: Page):
     except Exception:
         pass
     raise RecycleRequested()
+
+
+def _git_cmd(args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-c", f"safe.directory={ROOT_DIR}", *args],
+        cwd=str(ROOT_DIR),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def trigger_bot_restart():
+    """Signal main loop to close browser and exit cleanly, with a fallback restart if mid-sweep."""
+    _RESTART_EVENT.set()
+    time.sleep(3.5)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.getenv("INVOCATION_ID"):
+        try:
+            subprocess.Popen(
+                ["systemctl", "restart", "ktmb-sniper.service"],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            time.sleep(2.0)
+        except Exception:
+            pass
+        os._exit(0)
+    else:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def perform_bot_update(chat_id: str | None = None, force_restart: bool = False):
+    """Pull latest commits from origin/main (and install requirements if changed), then restart."""
+    with _SIDE_JOB_LOCK:
+        try:
+            old_res = _git_cmd(["rev-parse", "--short", "HEAD"])
+            old_sha = old_res.stdout.strip() if old_res.returncode == 0 else "unknown"
+
+            if not force_restart:
+                fetch_res = _git_cmd(["fetch", "origin", "main"], timeout=30)
+                if fetch_res.returncode != 0:
+                    err = (fetch_res.stderr or fetch_res.stdout).strip()
+                    send_telegram(f"❌ Update failed during git fetch:\n{err}", chat_id=chat_id)
+                    return
+
+                pending_res = _git_cmd(["log", "--oneline", "HEAD..origin/main"])
+                pending_commits = pending_res.stdout.strip() if pending_res.returncode == 0 else ""
+
+                if not pending_commits:
+                    head_msg_res = _git_cmd(["log", "-1", "--oneline"])
+                    head_line = head_msg_res.stdout.strip() if head_msg_res.returncode == 0 else old_sha
+                    send_telegram(
+                        f"✅ Already up to date on main.\n• Current: {head_line}",
+                        reply_markup={
+                            "inline_keyboard": [
+                                [
+                                    {"text": "♻️ Restart Bot Anyway", "callback_data": "bot_restart:now"},
+                                    {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+                                ]
+                            ]
+                        },
+                        chat_id=chat_id,
+                    )
+                    return
+
+                pull_res = _git_cmd(["pull", "--ff-only", "origin", "main"], timeout=30)
+                if pull_res.returncode != 0:
+                    err = (pull_res.stderr or pull_res.stdout).strip()
+                    send_telegram(f"❌ git pull failed (not restarting):\n{err}", chat_id=chat_id)
+                    return
+
+                new_res = _git_cmd(["rev-parse", "--short", "HEAD"])
+                new_sha = new_res.stdout.strip() if new_res.returncode == 0 else old_sha
+
+                diff_res = _git_cmd(["diff", "--name-only", old_sha, new_sha])
+                if diff_res.returncode == 0 and "requirements.txt" in (diff_res.stdout or "").splitlines():
+                    subprocess.run(
+                        [sys.executable, "-m", "pip", "install", "-r", str(ROOT_DIR / "requirements.txt")],
+                        cwd=str(ROOT_DIR),
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        check=False,
+                    )
+
+                try:
+                    _atomic_write_json(
+                        UPDATE_NOTIFY_FILE,
+                        {
+                            "chat_id": (chat_id or os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
+                            "sha": new_sha,
+                            "old_sha": old_sha,
+                        },
+                    )
+                except Exception:
+                    pass
+
+                commit_lines = "\n".join(f"• {line}" for line in pending_commits.splitlines()[:8])
+                send_telegram(
+                    f"🚀 Updated {old_sha} ➔ {new_sha}!\n{commit_lines}\n\n♻️ Restarting bot now...",
+                    chat_id=chat_id,
+                )
+            else:
+                try:
+                    _atomic_write_json(
+                        UPDATE_NOTIFY_FILE,
+                        {
+                            "chat_id": (chat_id or os.getenv("TELEGRAM_CHAT_ID", "")).strip(),
+                            "sha": old_sha,
+                            "old_sha": old_sha,
+                            "restarted_only": True,
+                        },
+                    )
+                except Exception:
+                    pass
+                send_telegram(f"♻️ Restarting bot ({old_sha}) now...", chat_id=chat_id)
+
+            trigger_bot_restart()
+        except Exception as e:
+            print(f"[!] Update failed: {e}")
+            send_telegram(f"❌ Update failed: {e}", chat_id=chat_id)
 
 
 def run_side_job(fn, *args):
@@ -1961,7 +2101,8 @@ def scan_and_snipe_all_dates(
         maybe_recycle(page)
         pause = current_poll_interval(poll_interval)
         print(f"[*] Finished full calendar sweep. Waiting {pause:g}s before next sweep...")
-        time.sleep(pause)
+        if sleep_or_wake(pause):
+            maybe_recycle(page)
         if single_sweep:
             return True
 
@@ -1972,12 +2113,13 @@ def register_telegram_bot_commands(token: str):
         commands = [
             {"command": "help", "description": "Open interactive bot menu"},
             {"command": "menu", "description": "Open interactive bot menu"},
-            {"command": "snipe", "description": "Add snipe: /snipe friday 19:00-22:00 woodlands-tebrau"},
+            {"command": "snipe", "description": "Add snipe: /snipe friday 7pm,8pm,9pm woodlands-tebrau"},
             {"command": "status", "description": "Show snipe schedule & booking state"},
             {"command": "buy", "description": "Instant buy: /buy YYYYMMDD HH:MM [route]"},
             {"command": "scrap_friday_woodlands_tebrau", "description": "PDF report: Fridays (Woodlands -> JB)"},
             {"command": "scrap_saturday_woodlands_tebrau", "description": "PDF report: Saturdays (Woodlands -> JB)"},
             {"command": "scrap_sunday_tebrau_woodlands", "description": "PDF report: Sundays (JB -> Woodlands)"},
+            {"command": "update", "description": "Pull latest code from GitHub & restart bot"},
         ]
         data = urllib.parse.urlencode({"commands": json.dumps(commands)}).encode("utf-8")
         req = urllib.request.Request(f"https://api.telegram.org/bot{token}/setMyCommands", data=data)
@@ -2160,7 +2302,10 @@ def _build_main_menu() -> tuple[str, dict]:
             ],
             [
                 {"text": "🗑 Remove Custom Snipe", "callback_data": "menu:snipe_del"},
-                {"text": "🔄 Refresh", "callback_data": "menu:main"},
+                {"text": "🔄 Update Bot", "callback_data": "menu:update"},
+            ],
+            [
+                {"text": "🔁 Refresh Menu", "callback_data": "menu:main"},
             ],
         ]
     }
@@ -2763,16 +2908,62 @@ def handle_menu_callback(cb_id: str, cb_data: str, chat_id: str, message_id: int
             args=(handle_scrape_command, scrap_cmd, chat_id),
             daemon=True,
         ).start()
+    elif cb_data == "menu:update":
+        answer_callback_query(cb_id, "⏳ Checking GitHub for updates...")
+        send_telegram("⏳ Checking GitHub for updates...", chat_id=chat_id)
+        threading.Thread(
+            target=perform_bot_update,
+            args=(chat_id, False),
+            daemon=True,
+        ).start()
+    elif cb_data == "bot_restart:now":
+        answer_callback_query(cb_id, "♻️ Restarting bot...")
+        threading.Thread(
+            target=perform_bot_update,
+            args=(chat_id, True),
+            daemon=True,
+        ).start()
+
+
+def _ack_telegram_offset(token: str, offset: int):
+    """Commit `offset` to Telegram getUpdates so the next boot does not replay the /update command."""
+    if not token or offset <= 0:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/getUpdates?offset={offset}&timeout=0"
+        urllib.request.urlopen(urllib.request.Request(url), timeout=5).read()
+    except Exception:
+        pass
+
+
+def _notify_if_just_updated():
+    """If the previous process exited for /update, send a back-online confirmation."""
+    if not UPDATE_NOTIFY_FILE.exists():
+        return
+    try:
+        info = json.loads(UPDATE_NOTIFY_FILE.read_text())
+    except Exception:
+        info = {}
+    try:
+        UPDATE_NOTIFY_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+    sha = info.get("sha", "")
+    target_chat = info.get("chat_id") or None
+    if sha:
+        action = "restarted" if info.get("restarted_only") else "updated & restarted"
+        send_telegram(f"✅ Bot {action} and online (commit {sha})!", chat_id=target_chat)
 
 
 def start_telegram_command_listener():
-    """Background listener for Telegram commands (/help, /menu, /snipe, /scrap..., /buy, /status)."""
+    """Background listener for Telegram commands (/help, /menu, /snipe, /scrap..., /buy, /status, /update)."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         return
 
     register_telegram_bot_commands(token)
-    print("[*] Telegram command listener started (listening for /help, /menu, /snipe, /scrap, /buy, /status)")
+    _notify_if_just_updated()
+    print("[*] Telegram command listener started (listening for /help, /menu, /snipe, /scrap, /buy, /status, /update)")
     last_update_id = 0
 
     while True:
@@ -2815,6 +3006,8 @@ def start_telegram_command_listener():
                                 if cb_chat_id and cb_msg_id:
                                     edit_telegram_message(cb_chat_id, cb_msg_id, f"{cb_orig_text}\n\n⏱️ Expired.")
                     else:
+                        if cb_data in ("menu:update", "bot_restart:now"):
+                            _ack_telegram_offset(token, last_update_id + 1)
                         handle_menu_callback(cb_id, cb_data, cb_chat_id, cb_msg_id)
                     continue
 
@@ -2904,6 +3097,17 @@ def start_telegram_command_listener():
                                 )
                             except Exception as e:
                                 send_telegram(f"❌ Could not add snipe: {e}", chat_id=chat_id)
+                elif cmd_name in ("/update", "/restart"):
+                    print(f"[*] Received Telegram {cmd_name} command from chat {chat_id}")
+                    _ack_telegram_offset(token, last_update_id + 1)
+                    force = cmd_name == "/restart" or "force" in text.lower().split()[1:]
+                    if not force:
+                        send_telegram("⏳ Checking GitHub for updates...", chat_id=chat_id)
+                    threading.Thread(
+                        target=perform_bot_update,
+                        args=(chat_id, force),
+                        daemon=True,
+                    ).start()
                 elif cmd_name == "/status":
                     status_text, status_kb = _build_status_menu()
                     send_telegram(status_text, reply_markup=status_kb, chat_id=chat_id)
@@ -3030,7 +3234,8 @@ def main():
                     maybe_recycle(page)
                     pause = current_poll_interval(args.interval)
                     print(f"[*] Finished sweep. Waiting {pause:g}s before next sweep...")
-                    time.sleep(pause)
+                    if sleep_or_wake(pause):
+                        maybe_recycle(page)
         elif args.mode == "single_sat":
             while True:
                 scan_custom_snipes(
@@ -3066,7 +3271,8 @@ def main():
                     maybe_recycle(page)
                     pause = current_poll_interval(args.interval)
                     print(f"[*] Finished sweep. Waiting {pause:g}s before next sweep...")
-                    time.sleep(pause)
+                    if sleep_or_wake(pause):
+                        maybe_recycle(page)
         else:  # auto_weekend
             # Sweep custom snipes, then alternate Saturdays and Sundays
             while True:
@@ -3122,7 +3328,8 @@ def main():
                     maybe_recycle(page)
                     pause = current_poll_interval(args.interval)
                     print(f"[*] Finished sweep. Waiting {pause:g}s before next sweep...")
-                    time.sleep(pause)
+                    if sleep_or_wake(pause):
+                        maybe_recycle(page)
 
 
 if __name__ == "__main__":
