@@ -147,6 +147,9 @@ def run_side_job(fn, *args):
 # Pending confirmation prompts keyed by request_id -> {"event": threading.Event, "approved": bool | None}
 _PENDING_CONFIRMATIONS: dict[str, dict] = {}
 _PENDING_CONFIRMATIONS_LOCK = threading.Lock()
+# Per-message interactive slot-picker draft state keyed by (chat_id, message_id)
+_MENU_DRAFTS: dict[tuple[str, int], dict] = {}
+_MENU_DRAFTS_LOCK = threading.Lock()
 
 
 def send_telegram(
@@ -213,16 +216,18 @@ def send_telegram(
         return None
 
 
-def answer_callback_query(callback_query_id: str, text: str = ""):
+def answer_callback_query(callback_query_id: str, text: str = "", show_alert: bool = False):
     """Acknowledge a Telegram inline button tap so the client stops showing a spinner."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token or not callback_query_id:
         return
     try:
         url = f"https://api.telegram.org/bot{token}/answerCallbackQuery"
-        payload = {"callback_query_id": callback_query_id}
+        payload: dict[str, str] = {"callback_query_id": callback_query_id}
         if text:
             payload["text"] = text
+        if show_alert:
+            payload["show_alert"] = "true"
         data = urllib.parse.urlencode(payload).encode("utf-8")
         urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
     except Exception as e:
@@ -443,22 +448,105 @@ def has_completed_booking_on_date(ktmb_date: str) -> bool:
     return False
 
 
+def _normalize_slots(
+    slots: list[str] | None,
+    start_time: str = "",
+    end_time: str = "",
+) -> tuple[list[str], str, str]:
+    """Validate and normalize slot specs (e.g. ['19:00-19:59', '20:15']) and return (slots, min_start, max_end)."""
+    raw_slots = [s.strip() for s in (slots or []) if s and s.strip()]
+    if not raw_slots:
+        if start_time and end_time:
+            raw_slots = [f"{start_time}-{end_time}"]
+        else:
+            raise ValueError("No time slots specified.")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    min_start: tuple[int, str] | None = None
+    max_end: tuple[int, str] | None = None
+
+    for item in raw_slots:
+        if "-" in item:
+            s_raw, e_raw = item.split("-", 1)
+            s_min = _hhmm_to_minutes(s_raw)
+            e_min = _hhmm_to_minutes(e_raw)
+            if s_min is None or e_min is None or s_min > e_min:
+                raise ValueError(f"Invalid time slot range: {item}")
+            s_fmt = f"{s_min // 60:02d}:{s_min % 60:02d}"
+            e_fmt = f"{e_min // 60:02d}:{e_min % 60:02d}"
+            spec = f"{s_fmt}-{e_fmt}"
+        else:
+            t_min = _hhmm_to_minutes(item)
+            if t_min is None:
+                raise ValueError(f"Invalid time slot: {item}")
+            s_min = e_min = t_min
+            s_fmt = e_fmt = f"{t_min // 60:02d}:{t_min % 60:02d}"
+            spec = s_fmt
+
+        if spec not in seen:
+            seen.add(spec)
+            normalized.append(spec)
+        if min_start is None or s_min < min_start[0]:
+            min_start = (s_min, s_fmt)
+        if max_end is None or e_min > max_end[0]:
+            max_end = (e_min, e_fmt)
+
+    assert min_start is not None and max_end is not None
+    return normalized, min_start[1], max_end[1]
+
+
+def _hour_label(hour: int) -> str:
+    if hour == 0:
+        return "12am"
+    if hour < 12:
+        return f"{hour}am"
+    if hour == 12:
+        return "12pm"
+    return f"{hour - 12}pm"
+
+
+def format_slots_summary(rule_or_slots) -> str:
+    """Format rule['slots'] (or a rule dict) nicely as e.g. '7pm, 8pm' or '20:15, 21:30'."""
+    if isinstance(rule_or_slots, dict):
+        slots = rule_or_slots.get("slots") or []
+        if not slots and rule_or_slots.get("start_time") and rule_or_slots.get("end_time"):
+            slots = [f"{rule_or_slots['start_time']}-{rule_or_slots['end_time']}"]
+    else:
+        slots = list(rule_or_slots or [])
+
+    parts: list[str] = []
+    for spec in slots:
+        if "-" in spec:
+            s, e = spec.split("-", 1)
+            if s.endswith(":00") and e.endswith(":59") and s[:2] == e[:2]:
+                parts.append(_hour_label(int(s[:2])))
+            else:
+                parts.append(f"{s}–{e}")
+        else:
+            parts.append(spec)
+    return ", ".join(parts) if parts else "-"
+
+
 def add_custom_snipe(
     ymd: str,
     origin: str,
     destination: str,
-    start_time: str,
-    end_time: str,
+    start_time: str = "",
+    end_time: str = "",
     target_pax: int | None = None,
+    slots: list[str] | None = None,
 ) -> dict:
-    """Add (or return existing active) custom one-off snipe rule and persist to custom_snipes.json."""
+    """
+    Add or narrow a custom one-off snipe rule and persist to custom_snipes.json.
+    If an unbooked active rule already exists for the same (ymd, origin, destination),
+    it updates that rule's slots in place so narrowing a schedule replaces the old window.
+    """
     dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
     ktmb_date = format_ktmb_date(dt)
     display_date = dt.strftime("%a, %d %b %Y")
-    start_min = _hhmm_to_minutes(start_time)
-    end_min = _hhmm_to_minutes(end_time)
-    if start_min is None or end_min is None or start_min > end_min:
-        raise ValueError(f"Invalid time window: {start_time}-{end_time}")
+    norm_slots, norm_start, norm_end = _normalize_slots(slots, start_time, end_time)
+
     if dt < datetime.date.today():
         raise ValueError(f"Date {display_date} is already in the past.")
     if has_completed_booking_on_date(ktmb_date):
@@ -481,9 +569,13 @@ def add_custom_snipe(
                 and existing.get("ymd") == ymd
                 and existing.get("origin") == origin
                 and existing.get("destination") == destination
-                and existing.get("start_time") == start_time
-                and existing.get("end_time") == end_time
             ):
+                if int(existing.get("booked_pax", 0)) == 0:
+                    existing["slots"] = norm_slots
+                    existing["start_time"] = norm_start
+                    existing["end_time"] = norm_end
+                    existing["target_pax"] = pax_goal
+                    _atomic_write_json(CUSTOM_SNIPES_FILE, rules)
                 return existing
 
         rule = {
@@ -493,8 +585,9 @@ def add_custom_snipe(
             "display_date": display_date,
             "origin": origin,
             "destination": destination,
-            "start_time": start_time,
-            "end_time": end_time,
+            "start_time": norm_start,
+            "end_time": norm_end,
+            "slots": norm_slots,
             "target_pax": pax_goal,
             "booked_pax": 0,
             "locked_train_time": None,
@@ -570,6 +663,39 @@ def _parse_time_token(tok: str) -> str | None:
     return None
 
 
+def _parse_slot_expression(expr: str) -> list[str] | None:
+    """
+    Parse comma-separated time expressions like:
+      '7pm'              -> ['19:00-19:59']
+      '7pm,8pm,9pm'      -> ['19:00-19:59', '20:00-20:59', '21:00-21:59']
+      '20:15,21:30'      -> ['20:15', '21:30']
+      '19:00-22:00'      -> ['19:00-22:00']
+      '7pm-10pm'         -> ['19:00-22:00']
+    """
+    items = [p.strip().lower() for p in expr.split(",") if p.strip()]
+    if not items:
+        return None
+    slots: list[str] = []
+    for item in items:
+        if "-" in item:
+            s_raw, e_raw = item.split("-", 1)
+            s_t = _parse_time_token(s_raw)
+            e_t = _parse_time_token(e_raw)
+            if not s_t or not e_t or _hhmm_to_minutes(s_t) > _hhmm_to_minutes(e_t):
+                return None
+            slots.append(f"{s_t}-{e_t}")
+        else:
+            t_fmt = _parse_time_token(item)
+            if not t_fmt:
+                return None
+            # Bare hour like '7pm' or '8am' covers that whole hour (e.g. 19:00-19:59)
+            if re.fullmatch(r"\d{1,2}\s*(am|pm)", item):
+                slots.append(f"{t_fmt[:2]}:00-{t_fmt[:2]}:59")
+            else:
+                slots.append(t_fmt)
+    return slots
+
+
 _SNIPE_WEEKDAY_MAP = {
     "monday": 0, "mon": 0,
     "tuesday": 1, "tue": 1,
@@ -613,12 +739,12 @@ def _resolve_snipe_date(token: str, today: datetime.date | None = None) -> datet
 
 def parse_snipe_command(text: str, today: datetime.date | None = None) -> dict | None:
     """
-    Parse `/snipe <date|weekday> <start-end> [route]` into
-    {ymd, date, display_date, origin, destination, start_time, end_time}.
+    Parse `/snipe <date|weekday> <slots_or_range> [route]` into
+    {ymd, date, display_date, origin, destination, start_time, end_time, slots}.
     Examples:
+      /snipe friday 7pm,8pm,9pm woodlands-tebrau
+      /snipe friday 20:15 woodlands-tebrau
       /snipe 20261120 19:00-22:00 woodlands-tebrau
-      /snipe friday 7pm-10pm woodlands-tebrau
-      /snipe this-friday 19:00-22:00 jb-woodlands
     """
     cleaned = text.strip()
     parts = cleaned.split()
@@ -632,18 +758,12 @@ def parse_snipe_command(text: str, today: datetime.date | None = None) -> dict |
     if dt is None:
         return None
 
-    time_raw = args[1].strip().lower()
-    if "-" in time_raw:
-        t_parts = time_raw.split("-", 1)
-        start_t = _parse_time_token(t_parts[0])
-        end_t = _parse_time_token(t_parts[1])
-    else:
-        start_t = _parse_time_token(time_raw)
-        end_t = start_t
-
-    if not start_t or not end_t:
+    slots = _parse_slot_expression(args[1])
+    if not slots:
         return None
-    if _hhmm_to_minutes(start_t) > _hhmm_to_minutes(end_t):
+    try:
+        norm_slots, start_t, end_t = _normalize_slots(slots)
+    except ValueError:
         return None
 
     if len(args) >= 3:
@@ -679,6 +799,7 @@ def parse_snipe_command(text: str, today: datetime.date | None = None) -> dict |
         "destination": destination,
         "start_time": start_t,
         "end_time": end_t,
+        "slots": norm_slots,
     }
 
 
@@ -710,6 +831,90 @@ def get_times_in_range(page: Page, section_selector: str, start_time: str, end_t
                 matched.append((mins, fmt))
     matched.sort(key=lambda item: item[0])
     return [fmt for _, fmt in matched]
+
+
+def get_times_for_rule(page: Page, section_selector: str, rule: dict) -> list[str]:
+    """Return sorted 'HH:MM' departure times visible on the page matching `rule['slots']` (or start/end)."""
+    slots = rule.get("slots")
+    if not slots:
+        return get_times_in_range(page, section_selector, rule["start_time"], rule["end_time"])
+
+    try:
+        hms = page.eval_on_selector_all(
+            f"{section_selector} tbody tr[data-hourminute]",
+            "els => els.map(e => e.getAttribute('data-hourminute'))",
+        )
+    except Exception:
+        return []
+
+    available_mins: list[tuple[int, str]] = []
+    seen_avail: set[str] = set()
+    for hm in hms or []:
+        if not hm:
+            continue
+        mins = _hhmm_to_minutes(str(hm))
+        if mins is not None:
+            fmt = f"{mins // 60:02d}:{mins % 60:02d}"
+            if fmt not in seen_avail:
+                seen_avail.add(fmt)
+                available_mins.append((mins, fmt))
+
+    matched: list[tuple[int, str]] = []
+    seen_matched: set[str] = set()
+    for slot in slots:
+        if "-" in slot:
+            s_part, e_part = slot.split("-", 1)
+            s_min = _hhmm_to_minutes(s_part)
+            e_min = _hhmm_to_minutes(e_part)
+            if s_min is None or e_min is None:
+                continue
+            for mins, fmt in available_mins:
+                if s_min <= mins <= e_min and fmt not in seen_matched:
+                    seen_matched.add(fmt)
+                    matched.append((mins, fmt))
+        else:
+            exact_min = _hhmm_to_minutes(slot)
+            if exact_min is None:
+                continue
+            fmt = f"{exact_min // 60:02d}:{exact_min % 60:02d}"
+            if fmt in seen_avail and fmt not in seen_matched:
+                seen_matched.add(fmt)
+                matched.append((exact_min, fmt))
+
+    matched.sort(key=lambda item: item[0])
+    return [fmt for _, fmt in matched]
+
+
+def fetch_day_timetable(ymd: str, origin: str, destination: str) -> list[dict]:
+    """Fetch live train departure times and seat counts for one date & route using headless Chromium."""
+    dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+    ktmb_date = format_ktmb_date(dt)
+    trains: list[dict] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 900})
+            submit_search(page, origin, destination, ktmb_date, "", pax=1)
+            rows = page.locator(".DepartSection tbody tr[data-hourminute]")
+            count = rows.count()
+            for idx in range(count):
+                row = rows.nth(idx)
+                hm = (row.get_attribute("data-hourminute") or "").strip()
+                mins = _hhmm_to_minutes(hm)
+                if mins is None:
+                    continue
+                time_fmt = f"{mins // 60:02d}:{mins % 60:02d}"
+                seats_text = row.locator("td").nth(4).inner_text().strip()
+                seats_match = re.search(r"(\d+)", seats_text)
+                seats = int(seats_match.group(1)) if seats_match else 0
+                trains.append({"time": time_fmt, "hm": f"{mins // 60:02d}{mins % 60:02d}", "seats": seats})
+        finally:
+            browser.close()
+    trains.sort(key=lambda x: x["hm"])
+    return trains
 
 
 def format_ktmb_date(d: datetime.date) -> str:
@@ -1481,9 +1686,7 @@ def scan_custom_snipes(
             if locked_time:
                 candidate_times = [locked_time]
             else:
-                candidate_times = get_times_in_range(
-                    page, ".DepartSection", rule["start_time"], rule["end_time"]
-                )
+                candidate_times = get_times_for_rule(page, ".DepartSection", rule)
             times_to_check = [
                 t
                 for t in candidate_times
@@ -1492,7 +1695,7 @@ def scan_custom_snipes(
             ]
             if not times_to_check:
                 print(
-                    f"    [{target_date:<12}] No upcoming trains in {rule['start_time']}-{rule['end_time']}"
+                    f"    [{target_date:<12}] No upcoming trains matching slots [{format_slots_summary(rule)}]"
                 )
                 continue
 
@@ -2015,35 +2218,173 @@ def _build_snipe_dir_menu(ymd: str) -> tuple[str, dict]:
     return text, keyboard
 
 
-def _build_snipe_time_menu(ymd: str, dir_code: str) -> tuple[str, dict]:
+def _get_or_init_draft(chat_id: str, message_id: int | None, ymd: str, dir_code: str, seed_existing: bool = False) -> dict:
+    key = (str(chat_id), int(message_id or 0))
+    with _MENU_DRAFTS_LOCK:
+        draft = _MENU_DRAFTS.get(key)
+        if draft is None or draft.get("ymd") != ymd or draft.get("dir") != dir_code:
+            hours: set[int] = set()
+            exact: set[str] = set()
+            if seed_existing:
+                origin, destination, _ = _dir_label(dir_code)
+                for r in load_custom_snipes():
+                    if (
+                        r.get("status") == "active"
+                        and r.get("ymd") == ymd
+                        and r.get("origin") == origin
+                        and r.get("destination") == destination
+                    ):
+                        for spec in r.get("slots") or []:
+                            if "-" in spec:
+                                s, e = spec.split("-", 1)
+                                if s.endswith(":00") and e.endswith(":59") and s[:2] == e[:2]:
+                                    hours.add(int(s[:2]))
+                            else:
+                                exact.add(spec)
+                        break
+            draft = {
+                "ymd": ymd,
+                "dir": dir_code,
+                "hours": hours,
+                "exact": exact,
+                "period": "eve",
+                "live_trains": None,
+            }
+            if chat_id and message_id:
+                _MENU_DRAFTS[key] = draft
+        return {
+            "ymd": draft["ymd"],
+            "dir": draft["dir"],
+            "hours": set(draft["hours"]),
+            "exact": set(draft["exact"]),
+            "period": draft["period"],
+            "live_trains": list(draft["live_trains"]) if draft["live_trains"] is not None else None,
+        }
+
+
+def _draft_selected_slots(draft: dict) -> list[str]:
+    slots: list[str] = []
+    for h in sorted(draft.get("hours") or []):
+        slots.append(f"{h:02d}:00-{h:02d}:59")
+    for t in sorted(draft.get("exact") or []):
+        slots.append(t)
+    return slots
+
+
+def _build_snipe_time_menu(
+    ymd: str,
+    dir_code: str,
+    chat_id: str = "",
+    message_id: int | None = None,
+    seed_existing: bool = False,
+    notice: str = "",
+) -> tuple[str, dict]:
     dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
     label = dt.strftime("%a, %d %b %Y")
     _, _, route_str = _dir_label(dir_code)
+    draft = _get_or_init_draft(chat_id, message_id, ymd, dir_code, seed_existing=seed_existing)
+    selected_slots = _draft_selected_slots(draft)
+    selected_summary = format_slots_summary(selected_slots) if selected_slots else "None yet"
+    period = draft.get("period", "eve")
+
+    notice_block = f"\n⚠️ {notice}\n" if notice else ""
     text = (
-        f"🎯 Add Custom Snipe — Step 3/3: Pick Time Window\n\n"
+        f"🎯 Add / Narrow Snipe — Step 3/3: Choose Wanted Slot(s)\n\n"
         f"• Date: {label}\n"
-        f"• Route: {route_str}\n\n"
-        f"The bot will pick the earliest available train in your selected window and stop after booking that day.\n\n"
-        f"Need another window? Send:\n"
-        f"/snipe {ymd} HH:MM-HH:MM {'woodlands-tebrau' if dir_code == 'w2j' else 'tebrau-woodlands'}"
+        f"• Route: {route_str}\n"
+        f"• Selected: {selected_summary}\n"
+        f"{notice_block}\n"
+        f"Tap 1 or more slots below (e.g. 7pm, 8pm, 9pm), then tap Save. "
+        f"The bot snatches the earliest available slot you picked and stops for that day.\n\n"
+        f"Or type directly:\n"
+        f"/snipe {ymd} 7pm,8pm {'woodlands-tebrau' if dir_code == 'w2j' else 'tebrau-woodlands'}"
     )
-    keyboard = {
-        "inline_keyboard": [
+
+    rows: list[list[dict]] = []
+    if period == "live" and draft.get("live_trains"):
+        live_trains = draft["live_trains"]
+        exact_set = draft["exact"]
+        row: list[dict] = []
+        for tr in live_trains:
+            t_fmt = tr["time"]
+            hm = tr["hm"]
+            seats = tr["seats"]
+            mark = "☑️" if t_fmt in exact_set else "⬜️"
+            row.append(
+                {
+                    "text": f"{mark} {t_fmt} ({seats})",
+                    "callback_data": f"se:{ymd}:{dir_code}:{hm}",
+                }
+            )
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([{"text": "🕒 Hour Slots (7pm, 8pm...)", "callback_data": f"sp:{ymd}:{dir_code}:eve"}])
+    elif period == "day":
+        hours_sel = draft["hours"]
+        day_hours = list(range(5, 17))  # 5am .. 4pm
+        for i in range(0, len(day_hours), 3):
+            rows.append(
+                [
+                    {
+                        "text": f"{'☑️' if h in hours_sel else '⬜️'} {_hour_label(h)}",
+                        "callback_data": f"st:{ymd}:{dir_code}:{h:02d}",
+                    }
+                    for h in day_hours[i : i + 3]
+                ]
+            )
+        rows.append(
             [
-                {"text": "🌆 7pm – 10pm (19:00-22:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1900-2200"},
-            ],
+                {"text": "🌆 Evening (5pm–11pm)", "callback_data": f"sp:{ymd}:{dir_code}:eve"},
+                {"text": "🔍 Exact KTMB Trains", "callback_data": f"sl:{ymd}:{dir_code}"},
+            ]
+        )
+    else:
+        hours_sel = draft["hours"]
+        eve_hours = list(range(17, 24))  # 5pm .. 11pm
+        rows.append(
             [
-                {"text": "🌇 5pm – 9pm (17:00-21:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1700-2100"},
-                {"text": "🌙 6pm – 11pm (18:00-23:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1800-2300"},
-            ],
+                {
+                    "text": f"{'☑️' if h in hours_sel else '⬜️'} {_hour_label(h)}",
+                    "callback_data": f"st:{ymd}:{dir_code}:{h:02d}",
+                }
+                for h in eve_hours[:3]
+            ]
+        )
+        rows.append(
             [
-                {"text": "☀️ 12pm – 3pm (12:00-15:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:1200-1500"},
-                {"text": "🌅 8am – 12pm (08:00-12:00)", "callback_data": f"snipe_time:{ymd}:{dir_code}:0800-1200"},
-            ],
-            [{"text": "⬅️ Back (Change Direction)", "callback_data": f"snipe_date:{ymd}"}],
-        ]
-    }
-    return text, keyboard
+                {
+                    "text": f"{'☑️' if h in hours_sel else '⬜️'} {_hour_label(h)}",
+                    "callback_data": f"st:{ymd}:{dir_code}:{h:02d}",
+                }
+                for h in eve_hours[3:6]
+            ]
+        )
+        rows.append(
+            [
+                {
+                    "text": f"{'☑️' if 23 in hours_sel else '⬜️'} 11pm",
+                    "callback_data": f"st:{ymd}:{dir_code}:23",
+                },
+                {"text": "☀️ Morning / Afternoon", "callback_data": f"sp:{ymd}:{dir_code}:day"},
+            ]
+        )
+        rows.append([{"text": "🔍 Load Exact Train Times (KTMB)", "callback_data": f"sl:{ymd}:{dir_code}"}])
+
+    if selected_slots:
+        rows.append(
+            [
+                {"text": f"✅ Save Selected ({len(selected_slots)})", "callback_data": f"ss:{ymd}:{dir_code}"},
+                {"text": "🧹 Clear", "callback_data": f"sc:{ymd}:{dir_code}"},
+            ]
+        )
+    else:
+        rows.append([{"text": "🌆 Quick: 7pm–10pm", "callback_data": f"sq:{ymd}:{dir_code}"}])
+
+    rows.append([{"text": "⬅️ Back (Change Direction)", "callback_data": f"snipe_date:{ymd}"}])
+    return text, {"inline_keyboard": rows}
 
 
 def _build_scrap_menu() -> tuple[str, dict]:
@@ -2087,7 +2428,7 @@ def _build_status_menu() -> tuple[str, dict]:
         target = int(r.get("target_pax", 2))
         locked = f" @ {r.get('locked_train_time')}" if r.get("locked_train_time") else ""
         custom_lines.append(
-            f"{icon} {r.get('display_date', r.get('date'))} | {route} | {r.get('start_time')}-{r.get('end_time')} | {booked}/{target} pax{locked}"
+            f"{icon} {r.get('display_date', r.get('date'))} | {route} | [{format_slots_summary(r)}] | {booked}/{target} pax{locked}"
         )
 
     state_lines = []
@@ -2110,7 +2451,7 @@ def _build_status_menu() -> tuple[str, dict]:
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "➕ Add Snipe", "callback_data": "menu:snipe_add"},
+                {"text": "➕ Add / Edit Snipe", "callback_data": "menu:snipe_add"},
                 {"text": "🗑 Remove Snipe", "callback_data": "menu:snipe_del"},
             ],
             [
@@ -2131,7 +2472,7 @@ def _build_snipe_del_menu() -> tuple[str, dict]:
         rows.append(
             [
                 {
-                    "text": f"❌ [{status}] {r.get('date')} {route} {r.get('start_time')}-{r.get('end_time')}",
+                    "text": f"❌ [{status}] {r.get('date')} {route} ({format_slots_summary(r)})",
                     "callback_data": f"snipe_rm:{r.get('id')}",
                 }
             ]
@@ -2169,6 +2510,66 @@ _SCRAP_CALLBACK_MAP = {
     "sun_j2w": ("/scrap-sunday-tebrau-woodlands", "Sundays (JB Sentral ➔ Woodlands CIQ)"),
     "sun_w2j": ("/scrap-sunday-woodlands-tebrau", "Sundays (Woodlands CIQ ➔ JB Sentral)"),
 }
+
+
+def _save_and_reply_snipe(
+    cb_id: str,
+    chat_id: str,
+    message_id: int | None,
+    ymd: str,
+    dir_code: str,
+    slots: list[str],
+):
+    origin, destination, route_str = _dir_label(dir_code)
+    try:
+        rule = add_custom_snipe(ymd, origin, destination, slots=slots)
+        if chat_id and message_id:
+            with _MENU_DRAFTS_LOCK:
+                _MENU_DRAFTS.pop((str(chat_id), int(message_id)), None)
+        answer_callback_query(cb_id, "✅ Snipe saved to schedule!")
+        text = (
+            f"✅ Saved to Live Sniping Schedule!\n\n"
+            f"• Date: {rule['display_date']}\n"
+            f"• Route: {route_str}\n"
+            f"• Wanted Slots: {format_slots_summary(rule)} (earliest available)\n"
+            f"• Target: {rule['target_pax']} pax\n"
+            f"• Rule: Auto-stops once a slot is snatched on this day."
+        )
+    except Exception as e:
+        answer_callback_query(cb_id, f"❌ {e}", show_alert=True)
+        text = f"❌ Could not save snipe: {e}"
+    kb = {
+        "inline_keyboard": [
+            [
+                {"text": "📋 View Schedule", "callback_data": "menu:status"},
+                {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+            ]
+        ]
+    }
+    if chat_id and message_id:
+        edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+
+
+def _load_live_trains_for_menu(ymd: str, dir_code: str, chat_id: str, message_id: int | None):
+    origin, destination, _ = _dir_label(dir_code)
+    notice = ""
+    with _SIDE_JOB_LOCK:
+        try:
+            trains = fetch_day_timetable(ymd, origin, destination)
+            if trains:
+                key = (str(chat_id), int(message_id or 0))
+                with _MENU_DRAFTS_LOCK:
+                    draft = _MENU_DRAFTS.get(key)
+                    if draft and draft.get("ymd") == ymd and draft.get("dir") == dir_code:
+                        draft["live_trains"] = trains
+                        draft["period"] = "live"
+            else:
+                notice = "KTMB has not released this date yet. Use Hour Slots (7pm, 8pm...) instead."
+        except Exception as e:
+            notice = f"Could not load KTMB timetable: {e}"
+    text, kb = _build_snipe_time_menu(ymd, dir_code, chat_id=chat_id, message_id=message_id, notice=notice)
+    if chat_id and message_id:
+        edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
 
 
 def handle_menu_callback(cb_id: str, cb_data: str, chat_id: str, message_id: int | None):
@@ -2214,41 +2615,127 @@ def handle_menu_callback(cb_id: str, cb_data: str, chat_id: str, message_id: int
         if len(parts) == 3:
             _, ymd, dir_code = parts
             answer_callback_query(cb_id)
-            text, kb = _build_snipe_time_menu(ymd, dir_code)
+            if chat_id and message_id:
+                with _MENU_DRAFTS_LOCK:
+                    _MENU_DRAFTS.pop((str(chat_id), int(message_id)), None)
+            text, kb = _build_snipe_time_menu(
+                ymd, dir_code, chat_id=chat_id, message_id=message_id, seed_existing=True
+            )
             if chat_id and message_id:
                 edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("st:"):
+        parts = cb_data.split(":")
+        if len(parts) == 4:
+            _, ymd, dir_code, hh_str = parts
+            hour = int(hh_str)
+            _get_or_init_draft(chat_id, message_id, ymd, dir_code)
+            key = (str(chat_id), int(message_id or 0))
+            with _MENU_DRAFTS_LOCK:
+                draft = _MENU_DRAFTS.get(key)
+                if draft is not None:
+                    if hour in draft["hours"]:
+                        draft["hours"].remove(hour)
+                    else:
+                        draft["hours"].add(hour)
+            answer_callback_query(cb_id)
+            text, kb = _build_snipe_time_menu(ymd, dir_code, chat_id=chat_id, message_id=message_id)
+            if chat_id and message_id:
+                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("se:"):
+        parts = cb_data.split(":")
+        if len(parts) == 4:
+            _, ymd, dir_code, hm_str = parts
+            t_fmt = f"{hm_str[:2]}:{hm_str[2:]}"
+            _get_or_init_draft(chat_id, message_id, ymd, dir_code)
+            key = (str(chat_id), int(message_id or 0))
+            with _MENU_DRAFTS_LOCK:
+                draft = _MENU_DRAFTS.get(key)
+                if draft is not None:
+                    if t_fmt in draft["exact"]:
+                        draft["exact"].remove(t_fmt)
+                    else:
+                        draft["exact"].add(t_fmt)
+            answer_callback_query(cb_id)
+            text, kb = _build_snipe_time_menu(ymd, dir_code, chat_id=chat_id, message_id=message_id)
+            if chat_id and message_id:
+                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("sp:"):
+        parts = cb_data.split(":")
+        if len(parts) == 4:
+            _, ymd, dir_code, period = parts
+            _get_or_init_draft(chat_id, message_id, ymd, dir_code)
+            key = (str(chat_id), int(message_id or 0))
+            with _MENU_DRAFTS_LOCK:
+                draft = _MENU_DRAFTS.get(key)
+                if draft is not None:
+                    draft["period"] = period
+            answer_callback_query(cb_id)
+            text, kb = _build_snipe_time_menu(ymd, dir_code, chat_id=chat_id, message_id=message_id)
+            if chat_id and message_id:
+                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("sc:"):
+        parts = cb_data.split(":")
+        if len(parts) == 3:
+            _, ymd, dir_code = parts
+            _get_or_init_draft(chat_id, message_id, ymd, dir_code)
+            key = (str(chat_id), int(message_id or 0))
+            with _MENU_DRAFTS_LOCK:
+                draft = _MENU_DRAFTS.get(key)
+                if draft is not None:
+                    draft["hours"].clear()
+                    draft["exact"].clear()
+            answer_callback_query(cb_id, "Cleared selection")
+            text, kb = _build_snipe_time_menu(ymd, dir_code, chat_id=chat_id, message_id=message_id)
+            if chat_id and message_id:
+                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("sl:"):
+        parts = cb_data.split(":")
+        if len(parts) == 3:
+            _, ymd, dir_code = parts
+            _get_or_init_draft(chat_id, message_id, ymd, dir_code)
+            answer_callback_query(cb_id, "⏳ Fetching live KTMB trains (~4s)...")
+            if chat_id and message_id:
+                dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+                _, _, route_str = _dir_label(dir_code)
+                edit_telegram_message(
+                    chat_id,
+                    message_id,
+                    f"⏳ Loading live KTMB train schedule for {dt.strftime('%a, %d %b %Y')} ({route_str})...",
+                    reply_markup={"inline_keyboard": [[{"text": "⬅️ Back", "callback_data": f"snipe_date:{ymd}"}]]},
+                )
+            threading.Thread(
+                target=_load_live_trains_for_menu,
+                args=(ymd, dir_code, chat_id, message_id),
+                daemon=True,
+            ).start()
+    elif cb_data.startswith("ss:"):
+        parts = cb_data.split(":")
+        if len(parts) == 3:
+            _, ymd, dir_code = parts
+            draft = _get_or_init_draft(chat_id, message_id, ymd, dir_code)
+            slots = _draft_selected_slots(draft)
+            if not slots:
+                answer_callback_query(cb_id, "⚠️ Tap at least one slot (e.g. 7pm, 8pm) first!", show_alert=True)
+                return
+            _save_and_reply_snipe(cb_id, chat_id, message_id, ymd, dir_code, slots)
+    elif cb_data.startswith("sq:"):
+        parts = cb_data.split(":")
+        if len(parts) == 3:
+            _, ymd, dir_code = parts
+            _save_and_reply_snipe(cb_id, chat_id, message_id, ymd, dir_code, ["19:00-22:00"])
     elif cb_data.startswith("snipe_time:"):
         parts = cb_data.split(":")
         if len(parts) == 4:
             _, ymd, dir_code, time_range = parts
             start_raw, end_raw = time_range.split("-", 1)
-            start_fmt = f"{start_raw[:2]}:{start_raw[2:]}"
-            end_fmt = f"{end_raw[:2]}:{end_raw[2:]}"
-            origin, destination, route_str = _dir_label(dir_code)
-            try:
-                rule = add_custom_snipe(ymd, origin, destination, start_fmt, end_fmt)
-                answer_callback_query(cb_id, "✅ Snipe added to schedule!")
-                text = (
-                    f"✅ Added to Live Sniping Schedule!\n\n"
-                    f"• Date: {rule['display_date']}\n"
-                    f"• Route: {route_str}\n"
-                    f"• Window: {start_fmt} – {end_fmt} (earliest available)\n"
-                    f"• Target: {rule['target_pax']} pax\n"
-                    f"• Rule: Auto-stops once a slot is snatched on this day."
-                )
-            except Exception as e:
-                answer_callback_query(cb_id, f"❌ {e}")
-                text = f"❌ Could not add snipe: {e}"
-            kb = {
-                "inline_keyboard": [
-                    [
-                        {"text": "📋 View Schedule", "callback_data": "menu:status"},
-                        {"text": "🏠 Main Menu", "callback_data": "menu:main"},
-                    ]
-                ]
-            }
-            if chat_id and message_id:
-                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+            _save_and_reply_snipe(
+                cb_id,
+                chat_id,
+                message_id,
+                ymd,
+                dir_code,
+                [f"{start_raw[:2]}:{start_raw[2:]}-{end_raw[:2]}:{end_raw[2:]}"],
+            )
     elif cb_data.startswith("snipe_rm:"):
         rule_id = cb_data.split(":", 1)[1]
         removed = remove_custom_snipe(rule_id)
@@ -2382,11 +2869,11 @@ def start_telegram_command_listener():
                         if not parsed_snipe:
                             send_telegram(
                                 "❌ Invalid /snipe format.\n\n"
-                                "Format: /snipe <date|weekday> <start-end> [route]\n"
+                                "Format: /snipe <date|weekday> <slots_or_range> [route]\n"
                                 "Examples:\n"
-                                "• /snipe friday 19:00-22:00 woodlands-tebrau\n"
-                                "• /snipe 20261120 7pm-10pm woodlands-tebrau\n"
-                                "• /snipe 20261122 19:00-22:00 tebrau-woodlands",
+                                "• /snipe friday 7pm,8pm,9pm woodlands-tebrau\n"
+                                "• /snipe friday 20:15 woodlands-tebrau\n"
+                                "• /snipe 20261120 19:00-22:00 tebrau-woodlands",
                                 reply_markup={"inline_keyboard": [[{"text": "🎯 Pick via Menu", "callback_data": "menu:snipe_add"}]]},
                                 chat_id=chat_id,
                             )
@@ -2396,14 +2883,13 @@ def start_telegram_command_listener():
                                     parsed_snipe["ymd"],
                                     parsed_snipe["origin"],
                                     parsed_snipe["destination"],
-                                    parsed_snipe["start_time"],
-                                    parsed_snipe["end_time"],
+                                    slots=parsed_snipe["slots"],
                                 )
                                 send_telegram(
-                                    f"✅ Added to Live Sniping Schedule!\n\n"
+                                    f"✅ Saved to Live Sniping Schedule!\n\n"
                                     f"• Date: {rule['display_date']}\n"
                                     f"• Route: {rule['origin']} ➔ {rule['destination']}\n"
-                                    f"• Window: {rule['start_time']} – {rule['end_time']} (earliest available)\n"
+                                    f"• Wanted Slots: {format_slots_summary(rule)} (earliest available)\n"
                                     f"• Target: {rule['target_pax']} pax\n"
                                     f"• Rule: Auto-stops once a slot is snatched on this day.",
                                     reply_markup={
