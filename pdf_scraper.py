@@ -9,8 +9,6 @@ import json
 import os
 import re
 import subprocess
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -93,16 +91,6 @@ def get_all_weekday_dates(weekday: int, max_weeks: int = 24) -> list[tuple[str, 
         dt = first_date + datetime.timedelta(days=w * 7)
         results.append((format_ktmb_date(dt), dt.strftime("%a, %d %b %Y")))
     return results
-
-
-def normalize_station_name(name: str) -> str:
-    """Map common station aliases to KTMB internal station names."""
-    n = name.strip().lower()
-    if any(k in n for k in ["woodland", "woodlands", "sg", "singapore", "ciq"]):
-        return "WOODLANDS CIQ"
-    if any(k in n for k in ["tebrau", "jb", "johor", "sentral"]):
-        return "JB SENTRAL"
-    return "WOODLANDS CIQ"
 
 
 def wait_for_trips_loaded(page, timeout_ms: int = 15_000):

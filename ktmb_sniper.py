@@ -38,7 +38,12 @@ from pathlib import Path
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
-from pdf_scraper import handle_scrape_command, parse_scrape_command
+from pdf_scraper import (
+    format_ktmb_date,
+    handle_scrape_command,
+    parse_scrape_command,
+    wait_for_trips_loaded,
+)
 
 BASE_URL = "https://shuttleonline.ktmb.com.my"
 SHUTTLE_URL = f"{BASE_URL}/Home/Shuttle"
@@ -1485,11 +1490,6 @@ def fetch_day_timetable(ymd: str, origin: str, destination: str) -> list[dict]:
     return trains
 
 
-def format_ktmb_date(d: datetime.date) -> str:
-    """Format date as 'D MMM YYYY' without leading zero on day (e.g. '15 Nov 2026' or '7 Feb 2027')."""
-    return f"{d.day} {d.strftime('%b %Y')}"
-
-
 def get_upcoming_weekday_dates(weekday: int, max_weeks: int = 26) -> list[str]:
     """
     Generate upcoming dates for a specific weekday (5 = Saturday, 6 = Sunday)
@@ -1501,22 +1501,6 @@ def get_upcoming_weekday_dates(weekday: int, max_weeks: int = 26) -> list[str]:
         days_ahead = 7
     first_date = today + datetime.timedelta(days=days_ahead)
     return [format_ktmb_date(first_date + datetime.timedelta(days=w * 7)) for w in range(max_weeks)]
-
-
-def wait_for_trips_loaded(page: Page, timeout_ms: int = 15_000):
-    """Wait until KTMB's RenderTrip AJAX finishes loading train rows and hides the loading modal."""
-    try:
-        page.wait_for_function(
-            """() => {
-                const rows = document.querySelectorAll('.depart-trips tr');
-                const modalVisible = document.querySelector('#popupModal.show');
-                return rows.length > 0 && !modalVisible;
-            }""",
-            timeout=timeout_ms,
-        )
-    except PlaywrightTimeoutError:
-        pass
-    page.wait_for_timeout(250)
 
 
 def ensure_logged_in(page: Page, email: str, password: str):
