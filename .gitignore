@@ -5,6 +5,7 @@ __pycache__/
 browser_profile/
 bookings_state.json
 custom_snipes.json
+blockout_dates.json
 .update_notify.json
 reports/
 screenshots/

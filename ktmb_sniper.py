@@ -48,6 +48,7 @@ ROOT_DIR = Path(__file__).parent.resolve()
 USER_DATA_DIR = ROOT_DIR / "browser_profile"
 STATE_FILE = ROOT_DIR / "bookings_state.json"
 CUSTOM_SNIPES_FILE = ROOT_DIR / "custom_snipes.json"
+BLOCKOUT_DATES_FILE = ROOT_DIR / "blockout_dates.json"
 UPDATE_NOTIFY_FILE = ROOT_DIR / ".update_notify.json"
 SCREENSHOT_DIR = ROOT_DIR / "screenshots"
 
@@ -59,6 +60,7 @@ _PROCESS_START = time.monotonic()
 _SIDE_JOB_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
 _CUSTOM_SNIPES_LOCK = threading.Lock()
+_BLOCKOUT_DATES_LOCK = threading.Lock()
 _RESTART_EVENT = threading.Event()
 
 
@@ -569,6 +571,226 @@ def load_custom_snipes() -> list[dict]:
 def save_custom_snipes(rules: list[dict]):
     with _CUSTOM_SNIPES_LOCK:
         _atomic_write_json(CUSTOM_SNIPES_FILE, rules)
+
+
+def _to_ymd(date_str: str) -> str | None:
+    """Normalize 'YYYYMMDD', 'YYYY-MM-DD', or KTMB 'D MMM YYYY' into 'YYYYMMDD'."""
+    s = (date_str or "").strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{8}", s):
+        try:
+            datetime.datetime.strptime(s, "%Y%m%d")
+            return s
+        except ValueError:
+            return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        try:
+            return datetime.datetime.strptime(s, "%Y-%m-%d").strftime("%Y%m%d")
+        except ValueError:
+            return None
+    for fmt in ("%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.datetime.strptime(s, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _format_ymd_display(ymd: str) -> str:
+    """Format 'YYYYMMDD' as 'Sat 26 Dec 2026'."""
+    try:
+        dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+        return dt.strftime("%a %-d %b %Y")
+    except Exception:
+        return ymd
+
+
+def _expand_date_range(start_dt: datetime.date, end_dt: datetime.date, max_days: int = 90) -> list[str]:
+    if end_dt < start_dt:
+        raise ValueError("End date must be on or after start date.")
+    delta = (end_dt - start_dt).days
+    if delta > max_days:
+        raise ValueError(f"Date range too large ({delta + 1} days; max {max_days + 1}).")
+    return [(start_dt + datetime.timedelta(days=i)).strftime("%Y%m%d") for i in range(delta + 1)]
+
+
+def _parse_env_blockout_dates() -> set[str]:
+    """Parse optional BLOCKOUT_DATES env var (comma-separated dates or YYYYMMDD-YYYYMMDD ranges)."""
+    raw = os.getenv("BLOCKOUT_DATES", "").strip()
+    if not raw:
+        return set()
+    result: set[str] = set()
+    for part in re.split(r"[\s,;]+", raw):
+        token = part.strip()
+        if not token:
+            continue
+        m_range = re.fullmatch(r"(\d{8}|\d{4}-\d{2}-\d{2})(?:\.\.|-|to)(\d{8}|\d{4}-\d{2}-\d{2})", token, re.IGNORECASE)
+        if m_range:
+            s_ymd = _to_ymd(m_range.group(1))
+            e_ymd = _to_ymd(m_range.group(2))
+            if s_ymd and e_ymd:
+                s_dt = datetime.datetime.strptime(s_ymd, "%Y%m%d").date()
+                e_dt = datetime.datetime.strptime(e_ymd, "%Y%m%d").date()
+                if e_dt >= s_dt and (e_dt - s_dt).days <= 366:
+                    for i in range((e_dt - s_dt).days + 1):
+                        result.add((s_dt + datetime.timedelta(days=i)).strftime("%Y%m%d"))
+            continue
+        ymd = _to_ymd(token)
+        if ymd:
+            result.add(ymd)
+    return result
+
+
+def load_blockout_dates(include_env: bool = True, upcoming_only: bool = False) -> list[str]:
+    """Return sorted list of blocked 'YYYYMMDD' dates from blockout_dates.json (and optionally .env)."""
+    stored: set[str] = set()
+    with _BLOCKOUT_DATES_LOCK:
+        if BLOCKOUT_DATES_FILE.exists():
+            try:
+                data = json.loads(BLOCKOUT_DATES_FILE.read_text())
+                if isinstance(data, list):
+                    for item in data:
+                        ymd = _to_ymd(str(item))
+                        if ymd:
+                            stored.add(ymd)
+            except Exception:
+                pass
+    if include_env:
+        stored |= _parse_env_blockout_dates()
+    if upcoming_only:
+        today_ymd = datetime.date.today().strftime("%Y%m%d")
+        stored = {d for d in stored if d >= today_ymd}
+    return sorted(stored)
+
+
+def save_blockout_dates(ymds: list[str]):
+    cleaned = sorted({y for d in ymds if (y := _to_ymd(str(d)))})
+    with _BLOCKOUT_DATES_LOCK:
+        _atomic_write_json(BLOCKOUT_DATES_FILE, cleaned)
+
+
+def add_blockout_dates(ymds: list[str]) -> list[str]:
+    """Add `ymds` to blockout_dates.json and return the sorted list of newly added dates."""
+    to_add = {y for d in ymds if (y := _to_ymd(str(d)))}
+    if not to_add:
+        return []
+    with _BLOCKOUT_DATES_LOCK:
+        existing: set[str] = set()
+        if BLOCKOUT_DATES_FILE.exists():
+            try:
+                data = json.loads(BLOCKOUT_DATES_FILE.read_text())
+                if isinstance(data, list):
+                    existing = {y for d in data if (y := _to_ymd(str(d)))}
+            except Exception:
+                pass
+        added = sorted(to_add - existing)
+        merged = sorted(existing | to_add)
+        _atomic_write_json(BLOCKOUT_DATES_FILE, merged)
+        return added
+
+
+def remove_blockout_dates(ymds: list[str]) -> list[str]:
+    """Remove `ymds` from blockout_dates.json and return the sorted list of removed dates."""
+    to_remove = {y for d in ymds if (y := _to_ymd(str(d)))}
+    if not to_remove:
+        return []
+    with _BLOCKOUT_DATES_LOCK:
+        existing: set[str] = set()
+        if BLOCKOUT_DATES_FILE.exists():
+            try:
+                data = json.loads(BLOCKOUT_DATES_FILE.read_text())
+                if isinstance(data, list):
+                    existing = {y for d in data if (y := _to_ymd(str(d)))}
+            except Exception:
+                pass
+        removed = sorted(existing & to_remove)
+        if removed:
+            _atomic_write_json(BLOCKOUT_DATES_FILE, sorted(existing - to_remove))
+        return removed
+
+
+def toggle_blockout_date(ymd: str) -> bool:
+    """Toggle a single 'YYYYMMDD' date in blockout_dates.json. Returns True if now blocked."""
+    norm = _to_ymd(ymd)
+    if not norm:
+        return False
+    with _BLOCKOUT_DATES_LOCK:
+        existing: set[str] = set()
+        if BLOCKOUT_DATES_FILE.exists():
+            try:
+                data = json.loads(BLOCKOUT_DATES_FILE.read_text())
+                if isinstance(data, list):
+                    existing = {y for d in data if (y := _to_ymd(str(d)))}
+            except Exception:
+                pass
+        if norm in existing:
+            existing.remove(norm)
+            now_blocked = False
+        else:
+            existing.add(norm)
+            now_blocked = True
+        _atomic_write_json(BLOCKOUT_DATES_FILE, sorted(existing))
+        return now_blocked
+
+
+def is_date_blocked(date_str: str) -> bool:
+    """True if `date_str` ('YYYYMMDD', 'YYYY-MM-DD', or KTMB 'D MMM YYYY') is in the blockout list."""
+    ymd = _to_ymd(date_str)
+    if not ymd:
+        return False
+    return ymd in load_blockout_dates(include_env=True)
+
+
+def parse_blockout_dates_spec(args_text: str, today: datetime.date | None = None) -> list[str]:
+    """
+    Parse `/block` or `/unblock` arguments into a sorted list of 'YYYYMMDD' dates.
+    Supports:
+      - YYYYMMDD or YYYY-MM-DD (e.g. 20261226, 2026-12-26)
+      - Ranges: 20261225-20261228 or 2026-12-25..2026-12-28
+      - Weekdays: sat, sun, this-sat, next-sun, today, tomorrow
+      - Weekend shortcuts: weekend, this-weekend, next-weekend
+      - Comma or space separated lists
+    """
+    today = today or datetime.date.today()
+    tokens = [t.strip() for t in re.split(r"[\s,]+", args_text.strip()) if t.strip()]
+    if not tokens:
+        return []
+    found: set[str] = set()
+    for token in tokens:
+        low = token.lower()
+        if low in ("weekend", "this-weekend", "this_weekend"):
+            sat = _next_date_for_weekday(5, 0, today)
+            sun = sat + datetime.timedelta(days=1)
+            found.add(sat.strftime("%Y%m%d"))
+            found.add(sun.strftime("%Y%m%d"))
+            continue
+        if low in ("next-weekend", "next_weekend"):
+            sat = _next_date_for_weekday(5, 1, today)
+            sun = sat + datetime.timedelta(days=1)
+            found.add(sat.strftime("%Y%m%d"))
+            found.add(sun.strftime("%Y%m%d"))
+            continue
+        m_range = re.fullmatch(r"(\d{8}|\d{4}-\d{2}-\d{2})(?:\.\.|-|to)(\d{8}|\d{4}-\d{2}-\d{2})", token, re.IGNORECASE)
+        if m_range:
+            s_ymd = _to_ymd(m_range.group(1))
+            e_ymd = _to_ymd(m_range.group(2))
+            if not s_ymd or not e_ymd:
+                raise ValueError(f"Invalid date range: {token}")
+            s_dt = datetime.datetime.strptime(s_ymd, "%Y%m%d").date()
+            e_dt = datetime.datetime.strptime(e_ymd, "%Y%m%d").date()
+            found.update(_expand_date_range(s_dt, e_dt))
+            continue
+        ymd = _to_ymd(token)
+        if ymd:
+            found.add(ymd)
+            continue
+        resolved = _resolve_snipe_date(token, today=today)
+        if resolved:
+            found.add(resolved.strftime("%Y%m%d"))
+            continue
+        raise ValueError(f"Unrecognized date: {token}")
+    return sorted(found)
 
 
 def has_completed_booking_on_date(ktmb_date: str) -> bool:
@@ -1770,6 +1992,8 @@ def scan_custom_snipes(
             rule["status"] = "completed"
             changed = True
             continue
+        if is_date_blocked(rule.get("ymd") or target_date):
+            continue
         active_rules.append(rule)
 
     if changed:
@@ -1958,15 +2182,16 @@ def scan_and_snipe_all_dates(
             active_dates = candidate_dates
 
         state = load_state()
-        # Filter out dates that already have total_pax booked (or completed via custom snipe)
+        # Filter out dates that already have total_pax booked, completed via custom snipe, or blocked
         pending_dates = [
             d
             for d in active_dates
             if int(state.get(f"{leg_prefix}_{d}", {}).get("booked_pax", 0)) < total_pax
             and not has_completed_booking_on_date(d)
+            and not is_date_blocked(d)
         ]
         if not pending_dates:
-            print(f"[+] All target dates for {leg_prefix} have {total_pax}/{total_pax} tickets booked!")
+            print(f"[+] All target dates for {leg_prefix} are booked or blocked!")
             return False
 
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
@@ -1984,7 +2209,7 @@ def scan_and_snipe_all_dates(
             booked_so_far = int(leg_state.get("booked_pax", 0))
             locked_time = leg_state.get("locked_train_time")
 
-            if booked_so_far >= total_pax or has_completed_booking_on_date(target_date):
+            if booked_so_far >= total_pax or has_completed_booking_on_date(target_date) or is_date_blocked(target_date):
                 continue
 
             skipped_times = set(leg_state.get("skipped_times", []))
@@ -2114,7 +2339,9 @@ def register_telegram_bot_commands(token: str):
             {"command": "help", "description": "Open interactive bot menu"},
             {"command": "menu", "description": "Open interactive bot menu"},
             {"command": "snipe", "description": "Add snipe: /snipe friday 7pm,8pm,9pm woodlands-tebrau"},
-            {"command": "status", "description": "Show snipe schedule & booking state"},
+            {"command": "block", "description": "Blockout dates: /block 20261226 or /block next-weekend"},
+            {"command": "unblock", "description": "Remove blockout dates: /unblock 20261226 or /unblock all"},
+            {"command": "status", "description": "Show snipe schedule, blockouts & booking state"},
             {"command": "buy", "description": "Instant buy: /buy YYYYMMDD HH:MM [route]"},
             {"command": "scrap_friday_woodlands_tebrau", "description": "PDF report: Fridays (Woodlands -> JB)"},
             {"command": "scrap_saturday_woodlands_tebrau", "description": "PDF report: Saturdays (Woodlands -> JB)"},
@@ -2283,11 +2510,13 @@ def _dir_label(dir_code: str) -> tuple[str, str, str]:
 
 def _build_main_menu() -> tuple[str, dict]:
     active_custom = [r for r in load_custom_snipes() if r.get("status") == "active"]
+    upcoming_blockouts = load_blockout_dates(include_env=True, upcoming_only=True)
     mode = os.getenv("BOOKING_MODE", "single_sun")
     text = (
         "🤖 KTMB Shuttle Tebrau Bot Menu\n\n"
         f"• Active Mode: {mode}\n"
-        f"• Custom Snipes Scheduled: {len(active_custom)}\n\n"
+        f"• Custom Snipes Scheduled: {len(active_custom)}\n"
+        f"• Blockout Dates: {len(upcoming_blockouts)}\n\n"
         "Tap an option below:"
     )
     keyboard = {
@@ -2297,14 +2526,15 @@ def _build_main_menu() -> tuple[str, dict]:
                 {"text": "📋 My Schedule & Status", "callback_data": "menu:status"},
             ],
             [
+                {"text": "🚫 Blockout Dates", "callback_data": "menu:blockout"},
                 {"text": "📊 Scrap PDF Report", "callback_data": "menu:scrap"},
+            ],
+            [
                 {"text": "⚡ Instant Buy Guide", "callback_data": "menu:buy"},
-            ],
-            [
                 {"text": "🗑 Remove Custom Snipe", "callback_data": "menu:snipe_del"},
-                {"text": "🔄 Update Bot", "callback_data": "menu:update"},
             ],
             [
+                {"text": "🔄 Update Bot", "callback_data": "menu:update"},
                 {"text": "🔁 Refresh Menu", "callback_data": "menu:main"},
             ],
         ]
@@ -2587,25 +2817,122 @@ def _build_status_menu() -> tuple[str, dict]:
         )
 
     custom_block = "\n".join(custom_lines) if custom_lines else "None scheduled."
+    upcoming_blockouts = load_blockout_dates(include_env=True, upcoming_only=True)
+    if upcoming_blockouts:
+        blockout_lines = [f"🚫 {_format_ymd_display(d)}" for d in upcoming_blockouts[:12]]
+        if len(upcoming_blockouts) > 12:
+            blockout_lines.append(f"… and {len(upcoming_blockouts) - 12} more")
+        blockout_block = "\n".join(blockout_lines)
+    else:
+        blockout_block = "None."
     state_block = "\n".join(state_lines) if state_lines else "No bookings recorded yet."
     text = (
         f"📋 Current Snipe Schedule & Bookings\n\n"
         f"🎯 Custom One-Off Snipes:\n{custom_block}\n\n"
+        f"🚫 Blockout Dates (Skipped):\n{blockout_block}\n\n"
         f"🔁 Recorded Bookings:\n{state_block}"
     )
     keyboard = {
         "inline_keyboard": [
             [
                 {"text": "➕ Add / Edit Snipe", "callback_data": "menu:snipe_add"},
-                {"text": "🗑 Remove Snipe", "callback_data": "menu:snipe_del"},
+                {"text": "🚫 Blockout Dates", "callback_data": "menu:blockout"},
             ],
             [
+                {"text": "🗑 Remove Snipe", "callback_data": "menu:snipe_del"},
                 {"text": "🔄 Refresh", "callback_data": "menu:status"},
+            ],
+            [
                 {"text": "🏠 Main Menu", "callback_data": "menu:main"},
             ],
         ]
     }
     return text, keyboard
+
+
+def _build_blockout_menu(page: int = 0, today: datetime.date | None = None) -> tuple[str, dict]:
+    """Interactive weekend toggle menu for blocking/unblocking dates."""
+    today = today or datetime.date.today()
+    page = max(0, min(page, 8))
+    weeks_per_page = 4
+    start_week = page * weeks_per_page
+
+    stored_set = set(load_blockout_dates(include_env=False, upcoming_only=False))
+    env_set = _parse_env_blockout_dates()
+    all_blocked = stored_set | env_set
+    upcoming_blocked = [d for d in sorted(all_blocked) if d >= today.strftime("%Y%m%d")]
+
+    if upcoming_blocked:
+        blocked_lines = [
+            f"• {_format_ymd_display(d)}" + (" (from .env)" if d in env_set and d not in stored_set else "")
+            for d in upcoming_blocked[:10]
+        ]
+        if len(upcoming_blocked) > 10:
+            blocked_lines.append(f"… and {len(upcoming_blocked) - 10} more")
+        summary = "\n".join(blocked_lines)
+    else:
+        summary = "None — all upcoming weekends are active."
+
+    rows: list[list[dict]] = []
+    # Base Saturday for week 0
+    first_sat = _next_date_for_weekday(5, 0, today)
+    # If today is Sunday, include today as the first weekend's Sunday alongside the next Saturday?
+    # Better: anchor each weekend row to Saturday + Sunday of that weekend.
+    if today.weekday() == 6:
+        # Today is Sunday: show today's Sunday on its own first if on page 0
+        if page == 0:
+            sun_ymd = today.strftime("%Y%m%d")
+            icon = "🚫" if sun_ymd in all_blocked else "⬜"
+            rows.append([
+                {
+                    "text": f"{icon} {today.strftime('%a %-d %b')} (Today)",
+                    "callback_data": f"blockout_toggle:{sun_ymd}:{page}",
+                }
+            ])
+
+    for w in range(start_week, start_week + weeks_per_page):
+        sat = first_sat + datetime.timedelta(days=7 * w)
+        sun = sat + datetime.timedelta(days=1)
+        sat_ymd = sat.strftime("%Y%m%d")
+        sun_ymd = sun.strftime("%Y%m%d")
+        sat_icon = "🚫" if sat_ymd in all_blocked else "⬜"
+        sun_icon = "🚫" if sun_ymd in all_blocked else "⬜"
+        rows.append([
+            {
+                "text": f"{sat_icon} {sat.strftime('%a %-d %b')}",
+                "callback_data": f"blockout_toggle:{sat_ymd}:{page}",
+            },
+            {
+                "text": f"{sun_icon} {sun.strftime('%a %-d %b')}",
+                "callback_data": f"blockout_toggle:{sun_ymd}:{page}",
+            },
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append({"text": "⬅️ Prev Weeks", "callback_data": f"blockout_page:{page - 1}"})
+    if page < 8:
+        nav_row.append({"text": "Next Weeks ➡️", "callback_data": f"blockout_page:{page + 1}"})
+    if nav_row:
+        rows.append(nav_row)
+
+    footer = []
+    if stored_set:
+        footer.append({"text": "🗑 Clear All", "callback_data": f"blockout_clear:{page}"})
+    footer.append({"text": "🏠 Main Menu", "callback_data": "menu:main"})
+    rows.append(footer)
+
+    text = (
+        "🚫 Blockout Dates (Dates to Skip)\n\n"
+        f"Currently blocked:\n{summary}\n\n"
+        "Tap any date below to toggle blockout ON (🚫) / OFF (⬜).\n\n"
+        "Or type a command for any date/range:\n"
+        "• /block 20261226\n"
+        "• /block 20261225-20261228\n"
+        "• /block next-weekend\n"
+        "• /unblock 20261226 (or /unblock all)"
+    )
+    return text, {"inline_keyboard": rows}
 
 
 def _build_snipe_del_menu() -> tuple[str, dict]:
@@ -2747,6 +3074,48 @@ def handle_menu_callback(cb_id: str, cb_data: str, chat_id: str, message_id: int
     elif cb_data == "menu:buy":
         answer_callback_query(cb_id)
         text, kb = _build_buy_guide_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "menu:blockout":
+        answer_callback_query(cb_id)
+        text, kb = _build_blockout_menu(0)
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("blockout_page:"):
+        try:
+            page_num = int(cb_data.split(":", 1)[1])
+        except ValueError:
+            page_num = 0
+        answer_callback_query(cb_id)
+        text, kb = _build_blockout_menu(page_num)
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("blockout_toggle:"):
+        parts = cb_data.split(":")
+        ymd = parts[1] if len(parts) >= 2 else ""
+        try:
+            page_num = int(parts[2]) if len(parts) >= 3 else 0
+        except ValueError:
+            page_num = 0
+        env_set = _parse_env_blockout_dates()
+        stored_set = set(load_blockout_dates(include_env=False))
+        if ymd in env_set and ymd not in stored_set:
+            answer_callback_query(cb_id, f"{_format_ymd_display(ymd)} is blocked via .env BLOCKOUT_DATES.")
+        else:
+            now_blocked = toggle_blockout_date(ymd)
+            label = _format_ymd_display(ymd)
+            answer_callback_query(cb_id, f"🚫 Blocked {label}" if now_blocked else f"✅ Unblocked {label}")
+        text, kb = _build_blockout_menu(page_num)
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("blockout_clear:"):
+        try:
+            page_num = int(cb_data.split(":", 1)[1])
+        except ValueError:
+            page_num = 0
+        save_blockout_dates([])
+        answer_callback_query(cb_id, "🗑 Cleared all saved blockout dates.")
+        text, kb = _build_blockout_menu(page_num)
         if chat_id and message_id:
             edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
     elif cb_data.startswith("snipe_date:"):
@@ -3108,6 +3477,89 @@ def start_telegram_command_listener():
                         args=(chat_id, force),
                         daemon=True,
                     ).start()
+                elif cmd_name in ("/block", "/blockout"):
+                    print(f"[*] Received Telegram {cmd_name} command: '{text}' from chat {chat_id}")
+                    args_part = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+                    if not args_part:
+                        b_text, b_kb = _build_blockout_menu(0)
+                        send_telegram(b_text, reply_markup=b_kb, chat_id=chat_id)
+                    else:
+                        try:
+                            ymds = parse_blockout_dates_spec(args_part)
+                            if not ymds:
+                                raise ValueError("No valid dates found.")
+                            add_blockout_dates(ymds)
+                            pretty = "\n".join(f"• {_format_ymd_display(d)}" for d in ymds[:15])
+                            if len(ymds) > 15:
+                                pretty += f"\n… and {len(ymds) - 15} more"
+                            send_telegram(
+                                f"🚫 Blocked {len(ymds)} date(s) — bot will skip these:\n{pretty}",
+                                reply_markup={
+                                    "inline_keyboard": [
+                                        [
+                                            {"text": "🚫 Manage Blockouts", "callback_data": "menu:blockout"},
+                                            {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+                                        ]
+                                    ]
+                                },
+                                chat_id=chat_id,
+                            )
+                        except Exception as e:
+                            send_telegram(
+                                f"❌ Could not block date(s): {e}\n\n"
+                                "Examples:\n"
+                                "• /block 20261226\n"
+                                "• /block 20261225-20261228\n"
+                                "• /block this-weekend\n"
+                                "• /block next-weekend",
+                                reply_markup={"inline_keyboard": [[{"text": "🚫 Open Blockout Menu", "callback_data": "menu:blockout"}]]},
+                                chat_id=chat_id,
+                            )
+                elif cmd_name in ("/unblock", "/unblockout"):
+                    print(f"[*] Received Telegram {cmd_name} command: '{text}' from chat {chat_id}")
+                    args_part = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+                    if not args_part:
+                        b_text, b_kb = _build_blockout_menu(0)
+                        send_telegram(b_text, reply_markup=b_kb, chat_id=chat_id)
+                    elif args_part.lower() == "all":
+                        save_blockout_dates([])
+                        send_telegram(
+                            "✅ Cleared all saved blockout dates.",
+                            reply_markup={"inline_keyboard": [[{"text": "🚫 Manage Blockouts", "callback_data": "menu:blockout"}]]},
+                            chat_id=chat_id,
+                        )
+                    else:
+                        try:
+                            ymds = parse_blockout_dates_spec(args_part)
+                            if not ymds:
+                                raise ValueError("No valid dates found.")
+                            removed = remove_blockout_dates(ymds)
+                            if removed:
+                                pretty = "\n".join(f"• {_format_ymd_display(d)}" for d in removed[:15])
+                                msg_out = f"✅ Unblocked {len(removed)} date(s):\n{pretty}"
+                            else:
+                                msg_out = "ℹ️ None of those dates were in your saved blockout list."
+                            send_telegram(
+                                msg_out,
+                                reply_markup={
+                                    "inline_keyboard": [
+                                        [
+                                            {"text": "🚫 Manage Blockouts", "callback_data": "menu:blockout"},
+                                            {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+                                        ]
+                                    ]
+                                },
+                                chat_id=chat_id,
+                            )
+                        except Exception as e:
+                            send_telegram(
+                                f"❌ Could not unblock date(s): {e}\n\n"
+                                "Examples:\n"
+                                "• /unblock 20261226\n"
+                                "• /unblock 20261225-20261228\n"
+                                "• /unblock all",
+                                chat_id=chat_id,
+                            )
                 elif cmd_name == "/status":
                     status_text, status_kb = _build_status_menu()
                     send_telegram(status_text, reply_markup=status_kb, chat_id=chat_id)
@@ -3164,6 +3616,9 @@ def main():
     if args.mode in ("auto_weekend", "single_sun"):
         print(f"  Sunday   (JB -> SG): Scanning all released Sundays ({sun_dates[0]} -> ...) | Trains: {sun_times}")
     print(f"  Custom Snipes      : {len([r for r in load_custom_snipes() if r.get('status') == 'active'])} active (editable via Telegram /help)")
+    upcoming_blockouts = load_blockout_dates(include_env=True, upcoming_only=True)
+    blockout_preview = f" ({', '.join(upcoming_blockouts[:5])}{'...' if len(upcoming_blockouts) > 5 else ''})" if upcoming_blockouts else ""
+    print(f"  Blockout Dates     : {len(upcoming_blockouts)} upcoming{blockout_preview} (editable via Telegram /block)")
     print(f"  Total Tickets/Date : {total_pax} Pax (Split 1+1 Snipe: {split_pax}) | Passengers: {pax_names}")
     print(
         f"  Sweep Interval     : {args.interval:g}s daytime | "
