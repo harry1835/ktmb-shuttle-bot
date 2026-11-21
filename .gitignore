@@ -6,6 +6,7 @@ browser_profile/
 bookings_state.json
 custom_snipes.json
 blockout_dates.json
+watch_list.json
 .update_notify.json
 reports/
 screenshots/

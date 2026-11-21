@@ -49,6 +49,7 @@ USER_DATA_DIR = ROOT_DIR / "browser_profile"
 STATE_FILE = ROOT_DIR / "bookings_state.json"
 CUSTOM_SNIPES_FILE = ROOT_DIR / "custom_snipes.json"
 BLOCKOUT_DATES_FILE = ROOT_DIR / "blockout_dates.json"
+WATCH_LIST_FILE = ROOT_DIR / "watch_list.json"
 UPDATE_NOTIFY_FILE = ROOT_DIR / ".update_notify.json"
 SCREENSHOT_DIR = ROOT_DIR / "screenshots"
 
@@ -61,6 +62,7 @@ _SIDE_JOB_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
 _CUSTOM_SNIPES_LOCK = threading.Lock()
 _BLOCKOUT_DATES_LOCK = threading.Lock()
+_WATCH_LIST_LOCK = threading.Lock()
 _RESTART_EVENT = threading.Event()
 
 
@@ -791,6 +793,210 @@ def parse_blockout_dates_spec(args_text: str, today: datetime.date | None = None
             continue
         raise ValueError(f"Unrecognized date: {token}")
     return sorted(found)
+
+
+def load_watch_list() -> list[dict]:
+    with _WATCH_LIST_LOCK:
+        if WATCH_LIST_FILE.exists():
+            try:
+                data = json.loads(WATCH_LIST_FILE.read_text())
+                return data if isinstance(data, list) else []
+            except Exception:
+                return []
+        return []
+
+
+def save_watch_list(rules: list[dict]):
+    with _WATCH_LIST_LOCK:
+        _atomic_write_json(WATCH_LIST_FILE, rules)
+
+
+def add_watch_rule(
+    ymd: str,
+    origin: str,
+    destination: str,
+    slots: list[str] | None = None,
+    min_seats: int = 1,
+    chat_id: str | None = None,
+) -> dict:
+    """Add or update an alert-only seat-drop watch rule in watch_list.json."""
+    dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+    if dt < datetime.date.today():
+        raise ValueError(f"Date {dt.strftime('%a, %d %b %Y')} is already in the past.")
+    ktmb_date = format_ktmb_date(dt)
+    display_date = dt.strftime("%a, %d %b %Y")
+    norm_slots, norm_start, norm_end = _normalize_slots(slots or ["00:00-23:59"])
+    min_seats = max(1, int(min_seats))
+
+    with _WATCH_LIST_LOCK:
+        rules: list[dict] = []
+        if WATCH_LIST_FILE.exists():
+            try:
+                loaded = json.loads(WATCH_LIST_FILE.read_text())
+                if isinstance(loaded, list):
+                    rules = loaded
+            except Exception:
+                rules = []
+
+        for existing in rules:
+            if (
+                existing.get("status", "active") == "active"
+                and existing.get("ymd") == ymd
+                and existing.get("origin") == origin
+                and existing.get("destination") == destination
+            ):
+                existing["slots"] = norm_slots
+                existing["start_time"] = norm_start
+                existing["end_time"] = norm_end
+                existing["min_seats"] = min_seats
+                if chat_id:
+                    existing["chat_id"] = str(chat_id)
+                existing["last_notified_seats"] = {}
+                existing["last_alert_ts"] = 0
+                _atomic_write_json(WATCH_LIST_FILE, rules)
+                return existing
+
+        rule = {
+            "id": str(int(time.time() * 1000)),
+            "ymd": ymd,
+            "date": ktmb_date,
+            "display_date": display_date,
+            "origin": origin,
+            "destination": destination,
+            "start_time": norm_start,
+            "end_time": norm_end,
+            "slots": norm_slots,
+            "min_seats": min_seats,
+            "last_notified_seats": {},
+            "last_alert_ts": 0,
+            "chat_id": str(chat_id or ""),
+            "status": "active",
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        rules.append(rule)
+        _atomic_write_json(WATCH_LIST_FILE, rules)
+        return rule
+
+
+def remove_watch_rule(rule_id: str) -> bool:
+    with _WATCH_LIST_LOCK:
+        if not WATCH_LIST_FILE.exists():
+            return False
+        try:
+            rules = json.loads(WATCH_LIST_FILE.read_text())
+            if not isinstance(rules, list):
+                return False
+        except Exception:
+            return False
+        kept = [r for r in rules if str(r.get("id")) != str(rule_id)]
+        if len(kept) == len(rules):
+            return False
+        _atomic_write_json(WATCH_LIST_FILE, kept)
+        return True
+
+
+def _format_watch_slots(rule: dict) -> str:
+    slots = rule.get("slots") or []
+    if slots == ["00:00-23:59"] or not slots:
+        return "All trains"
+    return format_slots_summary(rule)
+
+
+def _parse_route_token(tok: str) -> tuple[str, str] | None:
+    route_tokens = [t for t in re.split(r"[-_/]+", tok.lower()) if t]
+    origin = None
+    destination = None
+    for part in route_tokens:
+        if part in ("woodland", "woodlands", "sg", "singapore", "ciq"):
+            station = "WOODLANDS CIQ"
+        elif part in ("tebrau", "jb", "johor", "sentral"):
+            station = "JB SENTRAL"
+        else:
+            continue
+        if origin is None:
+            origin = station
+        elif destination is None and station != origin:
+            destination = station
+    if origin is None:
+        return None
+    if destination is None:
+        destination = "JB SENTRAL" if origin == "WOODLANDS CIQ" else "WOODLANDS CIQ"
+    return origin, destination
+
+
+def parse_watch_command(text: str, today: datetime.date | None = None) -> dict | None:
+    """
+    Parse `/watch <date|weekday> [slots_or_range] [route] [Nseats|Npax]` into
+    {ymd, date, display_date, origin, destination, slots, min_seats}.
+    Examples:
+      /watch 20261226
+      /watch 20261226 woodlands-tebrau
+      /watch 20261226 12:30,13:45 woodlands-tebrau
+      /watch sunday 7pm,8pm,9pm tebrau-woodlands 2seats
+    """
+    parts = text.strip().split()
+    if not parts:
+        return None
+    args = parts[1:] if parts[0].startswith("/") else parts
+    if not args:
+        return None
+
+    first_ymd = _to_ymd(args[0])
+    if first_ymd:
+        dt = datetime.datetime.strptime(first_ymd, "%Y%m%d").date()
+    else:
+        dt = _resolve_snipe_date(args[0], today=today)
+    if dt is None:
+        return None
+
+    slots: list[str] | None = None
+    route: tuple[str, str] | None = None
+    min_seats = 1
+
+    for tok in args[1:]:
+        m_seats = re.fullmatch(r"(\d+)\s*(?:seat|seats|pax|tix|ticket|tickets)?", tok.lower())
+        if m_seats and not re.fullmatch(r"\d{4}", tok):
+            val = int(m_seats.group(1))
+            if 1 <= val <= 10:
+                min_seats = val
+                continue
+        if tok.lower() in ("all", "any", "anytime"):
+            slots = ["00:00-23:59"]
+            continue
+        parsed_route = _parse_route_token(tok)
+        if parsed_route is not None and route is None:
+            route = parsed_route
+            continue
+        parsed_slots = _parse_slot_expression(tok)
+        if parsed_slots:
+            slots = parsed_slots
+            continue
+        return None
+
+    if route is None:
+        if dt.weekday() == 6:
+            origin, destination = "JB SENTRAL", "WOODLANDS CIQ"
+        else:
+            origin, destination = "WOODLANDS CIQ", "JB SENTRAL"
+    else:
+        origin, destination = route
+
+    try:
+        norm_slots, start_t, end_t = _normalize_slots(slots or ["00:00-23:59"])
+    except ValueError:
+        return None
+
+    return {
+        "ymd": dt.strftime("%Y%m%d"),
+        "date": format_ktmb_date(dt),
+        "display_date": dt.strftime("%a, %d %b %Y"),
+        "origin": origin,
+        "destination": destination,
+        "start_time": start_t,
+        "end_time": end_t,
+        "slots": norm_slots,
+        "min_seats": min_seats,
+    }
 
 
 def has_completed_booking_on_date(ktmb_date: str) -> bool:
@@ -2147,6 +2353,141 @@ def scan_custom_snipes(
     return True
 
 
+def scan_watch_list(page: Page) -> bool:
+    """
+    Scan all active alert-only watch rules in watch_list.json and send an immediate
+    Telegram alert whenever watched trains have >= min_seats available.
+    Does NOT click Select or trigger checkout/reCAPTCHA.
+    """
+    today_ymd = datetime.date.today().strftime("%Y%m%d")
+    rules = load_watch_list()
+    changed = False
+    active_rules: list[dict] = []
+
+    for rule in rules:
+        if rule.get("status", "active") != "active":
+            continue
+        if str(rule.get("ymd", "")) < today_ymd:
+            rule["status"] = "expired"
+            changed = True
+            continue
+        active_rules.append(rule)
+
+    if changed:
+        save_watch_list(rules)
+
+    if not active_rules:
+        return False
+
+    cooldown_sec = float(os.getenv("WATCH_ALERT_COOLDOWN_SECONDS", "300"))
+    by_route: dict[tuple[str, str], list[dict]] = {}
+    for rule in sorted(active_rules, key=lambda r: str(r.get("ymd", ""))):
+        key = (rule["origin"], rule["destination"])
+        by_route.setdefault(key, []).append(rule)
+
+    for (origin, destination), route_rules in by_route.items():
+        now_str = datetime.datetime.now().strftime("%H:%M:%S")
+        print(
+            f"\n==================== [Watchlist @ {now_str}] Checking {origin} -> {destination} ({len(route_rules)} date(s)) ===================="
+        )
+        submit_search(page, origin, destination, route_rules[0]["date"], "", pax=1)
+
+        for idx, rule in enumerate(route_rules):
+            target_date = rule["date"]
+            rule_id = rule["id"]
+            min_seats = max(1, int(rule.get("min_seats", 1)))
+
+            if idx > 0:
+                is_released = switch_date_in_place(page, target_date, "")
+                if not is_released:
+                    print(f"    [Watch {target_date:<12}] Not released yet on KTMB calendar.")
+                    continue
+            else:
+                if page.locator(".DepartSection tbody tr[data-hourminute]").count() == 0:
+                    print(f"    [Watch {target_date:<12}] Not released yet on KTMB calendar.")
+                    continue
+
+            candidate_times = get_times_for_rule(page, ".DepartSection", rule)
+            times_to_check = [
+                t
+                for t in candidate_times
+                if hours_until_train(target_date, t) is None or hours_until_train(target_date, t) > 0
+            ]
+            if not times_to_check:
+                print(f"    [Watch {target_date:<12}] No upcoming trains matching [{_format_watch_slots(rule)}]")
+                continue
+
+            avail_map: dict[str, int] = {}
+            status_parts = []
+            for time_str in times_to_check:
+                hm = time_str.replace(":", "").strip()
+                row = page.locator(f".DepartSection tbody tr[data-hourminute='{hm}']")
+                if row.count() == 0:
+                    continue
+                seats_text = row.first.locator("td").nth(4).inner_text().strip()
+                seats_match = re.search(r"(\d+)", seats_text)
+                seats_avail = int(seats_match.group(1)) if seats_match else 0
+                status_parts.append(f"{time_str}:{seats_avail}")
+                if seats_avail >= min_seats:
+                    avail_map[time_str] = seats_avail
+
+            print(f"    [Watch {target_date:<12}] {' | '.join(status_parts)}")
+
+            prev_map = rule.get("last_notified_seats") or {}
+            last_ts = float(rule.get("last_alert_ts", 0) or 0)
+            now_ts = time.time()
+
+            should_alert = False
+            if avail_map:
+                # Alert immediately on 0 -> available, new train appearing, seat count rising, or cooldown elapsed
+                if any(avail_map[t] > int(prev_map.get(t, 0)) for t in avail_map):
+                    should_alert = True
+                elif (now_ts - last_ts) >= cooldown_sec:
+                    should_alert = True
+
+            # Persist updated seat snapshot & timestamp
+            latest_rules = load_watch_list()
+            updated = False
+            for r in latest_rules:
+                if str(r.get("id")) == str(rule_id):
+                    if r.get("last_notified_seats") != avail_map:
+                        r["last_notified_seats"] = avail_map
+                        updated = True
+                    if should_alert:
+                        r["last_alert_ts"] = now_ts
+                        updated = True
+                    break
+            if updated:
+                save_watch_list(latest_rules)
+
+            if should_alert:
+                lines = "\n".join(
+                    f"  • {t} ➔ {cnt} seat{'s' if cnt != 1 else ''}"
+                    for t, cnt in sorted(avail_map.items())
+                )
+                target_chat = (rule.get("chat_id") or "").strip() or None
+                send_telegram(
+                    f"🚨 SEAT DROP ALERT!\n\n"
+                    f"• Date: {rule.get('display_date', target_date)}\n"
+                    f"• Route: {origin} ➔ {destination}\n"
+                    f"• Available Now:\n{lines}\n\n"
+                    f"👉 Book now: {SHUTTLE_URL}",
+                    reply_markup={
+                        "inline_keyboard": [
+                            [
+                                {"text": "🔗 Open KTMB Shuttle", "url": SHUTTLE_URL},
+                                {"text": "🗑 Stop Watching", "callback_data": f"watch_rm:{rule_id}"},
+                            ]
+                        ]
+                    },
+                    chat_id=target_chat,
+                )
+
+            time.sleep(0.4)
+
+    return True
+
+
 def scan_and_snipe_all_dates(
     page: Page,
     leg_prefix: str,
@@ -2339,6 +2680,8 @@ def register_telegram_bot_commands(token: str):
             {"command": "help", "description": "Open interactive bot menu"},
             {"command": "menu", "description": "Open interactive bot menu"},
             {"command": "snipe", "description": "Add snipe: /snipe friday 7pm,8pm,9pm woodlands-tebrau"},
+            {"command": "watch", "description": "Alert-only seat drop watch: /watch 20261226 [times] [route]"},
+            {"command": "unwatch", "description": "Stop watching dates: /unwatch or /unwatch all"},
             {"command": "block", "description": "Blockout dates: /block 20261226 or /block next-weekend"},
             {"command": "unblock", "description": "Remove blockout dates: /unblock 20261226 or /unblock all"},
             {"command": "status", "description": "Show snipe schedule, blockouts & booking state"},
@@ -2510,12 +2853,14 @@ def _dir_label(dir_code: str) -> tuple[str, str, str]:
 
 def _build_main_menu() -> tuple[str, dict]:
     active_custom = [r for r in load_custom_snipes() if r.get("status") == "active"]
+    active_watches = [r for r in load_watch_list() if r.get("status", "active") == "active"]
     upcoming_blockouts = load_blockout_dates(include_env=True, upcoming_only=True)
     mode = os.getenv("BOOKING_MODE", "single_sun")
     text = (
         "🤖 KTMB Shuttle Tebrau Bot Menu\n\n"
         f"• Active Mode: {mode}\n"
         f"• Custom Snipes Scheduled: {len(active_custom)}\n"
+        f"• Seat Watchlist (Alert-Only): {len(active_watches)}\n"
         f"• Blockout Dates: {len(upcoming_blockouts)}\n\n"
         "Tap an option below:"
     )
@@ -2523,18 +2868,21 @@ def _build_main_menu() -> tuple[str, dict]:
         "inline_keyboard": [
             [
                 {"text": "🎯 Add Snipe Schedule", "callback_data": "menu:snipe_add"},
+                {"text": "👀 Watch Seat Drops", "callback_data": "menu:watch"},
+            ],
+            [
                 {"text": "📋 My Schedule & Status", "callback_data": "menu:status"},
-            ],
-            [
                 {"text": "🚫 Blockout Dates", "callback_data": "menu:blockout"},
+            ],
+            [
                 {"text": "📊 Scrap PDF Report", "callback_data": "menu:scrap"},
-            ],
-            [
                 {"text": "⚡ Instant Buy Guide", "callback_data": "menu:buy"},
-                {"text": "🗑 Remove Custom Snipe", "callback_data": "menu:snipe_del"},
             ],
             [
+                {"text": "🗑 Remove Custom Snipe", "callback_data": "menu:snipe_del"},
                 {"text": "🔄 Update Bot", "callback_data": "menu:update"},
+            ],
+            [
                 {"text": "🔁 Refresh Menu", "callback_data": "menu:main"},
             ],
         ]
@@ -2817,6 +3165,17 @@ def _build_status_menu() -> tuple[str, dict]:
         )
 
     custom_block = "\n".join(custom_lines) if custom_lines else "None scheduled."
+    active_watches = [r for r in load_watch_list() if r.get("status", "active") == "active"]
+    if active_watches:
+        watch_lines = []
+        for w in active_watches:
+            w_route = "Woodlands➔JB" if w.get("origin") == "WOODLANDS CIQ" else "JB➔Woodlands"
+            watch_lines.append(
+                f"👀 {w.get('display_date', w.get('date'))} | {w_route} | [{_format_watch_slots(w)}] | ≥{w.get('min_seats', 1)} seat(s)"
+            )
+        watch_block = "\n".join(watch_lines)
+    else:
+        watch_block = "None."
     upcoming_blockouts = load_blockout_dates(include_env=True, upcoming_only=True)
     if upcoming_blockouts:
         blockout_lines = [f"🚫 {_format_ymd_display(d)}" for d in upcoming_blockouts[:12]]
@@ -2829,6 +3188,7 @@ def _build_status_menu() -> tuple[str, dict]:
     text = (
         f"📋 Current Snipe Schedule & Bookings\n\n"
         f"🎯 Custom One-Off Snipes:\n{custom_block}\n\n"
+        f"👀 Seat Watchlist (Alert-Only):\n{watch_block}\n\n"
         f"🚫 Blockout Dates (Skipped):\n{blockout_block}\n\n"
         f"🔁 Recorded Bookings:\n{state_block}"
     )
@@ -2836,13 +3196,14 @@ def _build_status_menu() -> tuple[str, dict]:
         "inline_keyboard": [
             [
                 {"text": "➕ Add / Edit Snipe", "callback_data": "menu:snipe_add"},
+                {"text": "👀 Watch Seat Drops", "callback_data": "menu:watch"},
+            ],
+            [
                 {"text": "🚫 Blockout Dates", "callback_data": "menu:blockout"},
-            ],
-            [
                 {"text": "🗑 Remove Snipe", "callback_data": "menu:snipe_del"},
-                {"text": "🔄 Refresh", "callback_data": "menu:status"},
             ],
             [
+                {"text": "🔄 Refresh", "callback_data": "menu:status"},
                 {"text": "🏠 Main Menu", "callback_data": "menu:main"},
             ],
         ]
@@ -2933,6 +3294,84 @@ def _build_blockout_menu(page: int = 0, today: datetime.date | None = None) -> t
         "• /unblock 20261226 (or /unblock all)"
     )
     return text, {"inline_keyboard": rows}
+
+
+def _build_watch_menu(today: datetime.date | None = None) -> tuple[str, dict]:
+    """Interactive menu for alert-only seat-drop watches."""
+    today = today or datetime.date.today()
+    active_watches = [r for r in load_watch_list() if r.get("status", "active") == "active"]
+
+    rows: list[list[dict]] = []
+    if active_watches:
+        watch_lines = []
+        for w in active_watches:
+            route_short = "W➔JB" if w.get("origin") == "WOODLANDS CIQ" else "JB➔W"
+            watch_lines.append(
+                f"• {w.get('display_date', w.get('date'))} | {route_short} | {_format_watch_slots(w)} (≥{w.get('min_seats', 1)} seat)"
+            )
+            rows.append([
+                {
+                    "text": f"❌ Stop: {w.get('date')} {route_short} ({_format_watch_slots(w)})",
+                    "callback_data": f"watch_rm:{w.get('id')}",
+                }
+            ])
+        summary = "\n".join(watch_lines)
+    else:
+        summary = "No active seat-drop watches."
+
+    # Quick-add buttons for upcoming Fri/Sat/Sun
+    fri0 = _next_date_for_weekday(4, 0, today)
+    sat0 = _next_date_for_weekday(5, 0, today)
+    sun0 = _next_date_for_weekday(6, 0, today)
+    sat1 = _next_date_for_weekday(5, 1, today)
+    sun1 = _next_date_for_weekday(6, 1, today)
+    fri1 = _next_date_for_weekday(4, 1, today)
+
+    def _qbtn(dt: datetime.date, tag: str) -> dict:
+        return {
+            "text": f"➕ {dt.strftime('%a %-d %b')} ({tag})",
+            "callback_data": f"watch_date:{dt.strftime('%Y%m%d')}",
+        }
+
+    rows.append([_qbtn(fri0, "This Fri"), _qbtn(sat0, "This Sat")])
+    rows.append([_qbtn(sun0, "This Sun"), _qbtn(fri1, "Next Fri")])
+    rows.append([_qbtn(sat1, "Next Sat"), _qbtn(sun1, "Next Sun")])
+
+    footer = []
+    if active_watches:
+        footer.append({"text": "🗑 Clear All", "callback_data": "watch_clear"})
+    footer.append({"text": "🏠 Main Menu", "callback_data": "menu:main"})
+    rows.append(footer)
+
+    text = (
+        "👀 Seat-Drop Watchlist (Alert-Only — No Auto-Buy)\n\n"
+        f"Active watches:\n{summary}\n\n"
+        "Tap a date below to watch all trains, or send a custom command:\n"
+        "• /watch 20261226 woodlands-tebrau\n"
+        "• /watch 20261226 12:30,13:45 woodlands-tebrau\n"
+        "• /watch sunday 7pm,8pm,9pm tebrau-woodlands 2seats\n"
+        "• /unwatch all"
+    )
+    return text, {"inline_keyboard": rows}
+
+
+def _build_watch_dir_menu(ymd: str) -> tuple[str, dict]:
+    dt = datetime.datetime.strptime(ymd, "%Y%m%d").date()
+    display = dt.strftime("%a, %d %b %Y")
+    text = (
+        f"👀 Watch Seat Drops — Pick Direction\n\n"
+        f"• Date: {display}\n"
+        f"• Alert on: Any train with ≥1 seat available\n\n"
+        f"Choose direction:"
+    )
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "🇸🇬 Woodlands CIQ ➔ JB Sentral 🇲🇾", "callback_data": f"watch_add:{ymd}:w2jb"}],
+            [{"text": "🇲🇾 JB Sentral ➔ Woodlands CIQ 🇸🇬", "callback_data": f"watch_add:{ymd}:jb2w"}],
+            [{"text": "⬅️ Back to Watchlist", "callback_data": "menu:watch"}],
+        ]
+    }
+    return text, keyboard
 
 
 def _build_snipe_del_menu() -> tuple[str, dict]:
@@ -3116,6 +3555,43 @@ def handle_menu_callback(cb_id: str, cb_data: str, chat_id: str, message_id: int
         save_blockout_dates([])
         answer_callback_query(cb_id, "🗑 Cleared all saved blockout dates.")
         text, kb = _build_blockout_menu(page_num)
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "menu:watch":
+        answer_callback_query(cb_id)
+        text, kb = _build_watch_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("watch_date:"):
+        ymd = cb_data.split(":", 1)[1]
+        answer_callback_query(cb_id)
+        text, kb = _build_watch_dir_menu(ymd)
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("watch_add:"):
+        parts = cb_data.split(":")
+        if len(parts) == 3:
+            _, ymd, dir_code = parts
+            origin, dest, _ = _dir_code_to_stations(dir_code)
+            try:
+                rule = add_watch_rule(ymd, origin, dest, slots=["00:00-23:59"], min_seats=1, chat_id=chat_id)
+                answer_callback_query(cb_id, f"👀 Watching {rule['date']}!")
+            except Exception as e:
+                answer_callback_query(cb_id, f"Error: {e}")
+            text, kb = _build_watch_menu()
+            if chat_id and message_id:
+                edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data.startswith("watch_rm:"):
+        rule_id = cb_data.split(":", 1)[1]
+        removed = remove_watch_rule(rule_id)
+        answer_callback_query(cb_id, "🗑 Stopped watching." if removed else "Already removed.")
+        text, kb = _build_watch_menu()
+        if chat_id and message_id:
+            edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
+    elif cb_data == "watch_clear":
+        save_watch_list([])
+        answer_callback_query(cb_id, "🗑 Cleared all watches.")
+        text, kb = _build_watch_menu()
         if chat_id and message_id:
             edit_telegram_message(chat_id, message_id, text, reply_markup=kb)
     elif cb_data.startswith("snipe_date:"):
@@ -3560,6 +4036,66 @@ def start_telegram_command_listener():
                                 "• /unblock all",
                                 chat_id=chat_id,
                             )
+                elif cmd_name == "/watch":
+                    print(f"[*] Received Telegram /watch command: '{text}' from chat {chat_id}")
+                    if len(text.split()) == 1:
+                        w_text, w_kb = _build_watch_menu()
+                        send_telegram(w_text, reply_markup=w_kb, chat_id=chat_id)
+                    else:
+                        parsed_watch = parse_watch_command(text)
+                        if not parsed_watch:
+                            send_telegram(
+                                "❌ Invalid /watch format.\n\n"
+                                "Format: /watch <date|weekday> [slots_or_range] [route] [Nseats]\n"
+                                "Examples:\n"
+                                "• /watch 20261226 woodlands-tebrau\n"
+                                "• /watch 20261226 12:30,13:45 woodlands-tebrau\n"
+                                "• /watch sunday 7pm,8pm,9pm tebrau-woodlands 2seats",
+                                reply_markup={"inline_keyboard": [[{"text": "👀 Open Watch Menu", "callback_data": "menu:watch"}]]},
+                                chat_id=chat_id,
+                            )
+                        else:
+                            try:
+                                rule = add_watch_rule(
+                                    parsed_watch["ymd"],
+                                    parsed_watch["origin"],
+                                    parsed_watch["destination"],
+                                    slots=parsed_watch["slots"],
+                                    min_seats=parsed_watch["min_seats"],
+                                    chat_id=chat_id,
+                                )
+                                send_telegram(
+                                    f"👀 Watching for Seat Drops (Alert-Only)!\n\n"
+                                    f"• Date: {rule['display_date']}\n"
+                                    f"• Route: {rule['origin']} ➔ {rule['destination']}\n"
+                                    f"• Trains: {_format_watch_slots(rule)}\n"
+                                    f"• Trigger: ≥ {rule['min_seats']} seat(s) available\n"
+                                    f"• Mode: Instant Telegram alert only (no auto-buy).",
+                                    reply_markup={
+                                        "inline_keyboard": [
+                                            [
+                                                {"text": "👀 Manage Watchlist", "callback_data": "menu:watch"},
+                                                {"text": "🏠 Main Menu", "callback_data": "menu:main"},
+                                            ]
+                                        ]
+                                    },
+                                    chat_id=chat_id,
+                                )
+                            except Exception as e:
+                                send_telegram(f"❌ Could not add watch: {e}", chat_id=chat_id)
+                elif cmd_name == "/unwatch":
+                    print(f"[*] Received Telegram /unwatch command: '{text}' from chat {chat_id}")
+                    args_part = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+                    if args_part.lower() == "all":
+                        save_watch_list([])
+                        send_telegram(
+                            "✅ Cleared all seat-drop watches.",
+                            reply_markup={"inline_keyboard": [[{"text": "👀 Watchlist Menu", "callback_data": "menu:watch"}]]},
+                            chat_id=chat_id,
+                        )
+                    else:
+                        w_text, w_kb = _build_watch_menu()
+                        send_telegram(w_text, reply_markup=w_kb, chat_id=chat_id)
                 elif cmd_name == "/status":
                     status_text, status_kb = _build_status_menu()
                     send_telegram(status_text, reply_markup=status_kb, chat_id=chat_id)
@@ -3616,6 +4152,7 @@ def main():
     if args.mode in ("auto_weekend", "single_sun"):
         print(f"  Sunday   (JB -> SG): Scanning all released Sundays ({sun_dates[0]} -> ...) | Trains: {sun_times}")
     print(f"  Custom Snipes      : {len([r for r in load_custom_snipes() if r.get('status') == 'active'])} active (editable via Telegram /help)")
+    print(f"  Seat Watchlist     : {len([r for r in load_watch_list() if r.get('status', 'active') == 'active'])} active (alert-only via Telegram /watch)")
     upcoming_blockouts = load_blockout_dates(include_env=True, upcoming_only=True)
     blockout_preview = f" ({', '.join(upcoming_blockouts[:5])}{'...' if len(upcoming_blockouts) > 5 else ''})" if upcoming_blockouts else ""
     print(f"  Blockout Dates     : {len(upcoming_blockouts)} upcoming{blockout_preview} (editable via Telegram /block)")
@@ -3656,6 +4193,7 @@ def main():
 
         if args.mode == "single_sun":
             while True:
+                scan_watch_list(page)
                 scan_custom_snipes(
                     page=page,
                     total_pax=total_pax,
@@ -3693,6 +4231,7 @@ def main():
                         maybe_recycle(page)
         elif args.mode == "single_sat":
             while True:
+                scan_watch_list(page)
                 scan_custom_snipes(
                     page=page,
                     total_pax=total_pax,
@@ -3729,8 +4268,9 @@ def main():
                     if sleep_or_wake(pause):
                         maybe_recycle(page)
         else:  # auto_weekend
-            # Sweep custom snipes, then alternate Saturdays and Sundays
+            # Sweep watchlist & custom snipes, then alternate Saturdays and Sundays
             while True:
+                scan_watch_list(page)
                 scan_custom_snipes(
                     page=page,
                     total_pax=total_pax,

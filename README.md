@@ -60,7 +60,8 @@ journalctl -u ktmb-sniper.service -f
 
 Send **`/help`** (or **`/menu`**) in your Telegram channel or bot chat to open the interactive inline button menu:
 - **🎯 Add Snipe Schedule**: Pick Date (e.g. This Friday) ➔ Pick Direction ➔ Choose Wanted Slot(s) (`7pm`, `8pm`, `9pm`, morning/afternoon hours, or **Load Exact Train Times** from KTMB). Added directly into the live background sniping loop, picks the earliest available selected slot, and automatically stops after snatching 1 slot on that day.
-- **📋 My Schedule & Status**: View active custom snipes, blockout dates, and recorded weekend bookings.
+- **👀 Watch Seat Drops** (or **`/watch`** / **`/unwatch`**): Alert-only seat-drop monitor for sold-out dates (even dates already booked). Sends an instant Telegram alert with available train times, seat counts, and a direct KTMB link — without auto-buying or triggering checkout. Examples: `/watch 20261226 woodlands-tebrau`, `/watch 20261226 12:30,13:45 woodlands-tebrau`, `/watch sunday 7pm,8pm,9pm tebrau-woodlands 2seats`.
+- **📋 My Schedule & Status**: View active custom snipes, watchlist, blockout dates, and recorded weekend bookings.
 - **🚫 Blockout Dates** (or **`/block`** / **`/unblock`**): Toggle upcoming Saturdays/Sundays to skip, or block custom dates/ranges (e.g. `/block 20261226`, `/block 20261225-20261228`, `/block next-weekend`, `/unblock all`). Saved in `blockout_dates.json` (and optionally via `BLOCKOUT_DATES` in `.env`).
 - **📊 Scrap PDF Report**: One-tap PDF reports for Fridays, Saturdays, or Sundays in either direction.
 - **🗑 Remove Custom Snipe**: Cancel any scheduled custom snipe.
